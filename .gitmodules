@@ -1,0 +1,4 @@
+[submodule "nix"]
+	path = nix
+	url = https://github.com/clefru/nix.git
+	branch = casper
