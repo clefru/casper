@@ -13,11 +13,12 @@
 final: prev:
 let
   /* Low-level helper that works on any derivation (even non-stdenv.mkDerivation
-     builders) via overrideAttrs when available, falling back to overrideDerivation. */
+     builders) via overrideAttrs when available, falling back to overrideDerivation.
+     Generates a NAR -> NAR (stdin -> stdout) `$out/nix-support/relocate.sh <old> <new>`. */
   withCasper =
     {
       relocateExtra ? "",
-      hashExtra ? "",
+      relocateStream ? "",
     }:
     pkg:
     let
@@ -26,20 +27,42 @@ let
           if [ -d "$out" ]; then
             mkdir -p "$out/nix-support"
         ''
-        + prev.lib.optionalString (relocateExtra != "") ''
+        + prev.lib.optionalString (relocateStream != "") ''
             cat << 'CASPER_RELOCATE_EOF' > "$out/nix-support/relocate.sh"
           #!/bin/sh
           export LC_ALL=C
-          target="$1"
-          old="$2"
-          new="$3"
-          if [ -z "$target" ] || [ -z "$old" ] || [ -z "$new" ] || [ "$old" = "$new" ]; then
+          set -e
+          old="$1"
+          new="$2"
+          if [ -z "$old" ] || [ -z "$new" ] || [ "$old" = "$new" ]; then
+              cat
+              exit 0
+          fi
+          ${relocateStream}
+          CASPER_RELOCATE_EOF
+            chmod +x "$out/nix-support/relocate.sh"
+        ''
+        + prev.lib.optionalString (relocateStream == "" && relocateExtra != "") ''
+            cat << 'CASPER_RELOCATE_EOF' > "$out/nix-support/relocate.sh"
+          #!/bin/sh
+          export LC_ALL=C
+          set -e
+          old="$1"
+          new="$2"
+          if [ -z "$old" ] || [ -z "$new" ] || [ "$old" = "$new" ]; then
+              cat
               exit 0
           fi
 
+          workdir=$(mktemp -d)
+          trap 'chmod -R u+w "$workdir" 2>/dev/null || true; rm -rf "$workdir"' EXIT
+          target="$workdir/root"
+          nix-store --restore "$target"
+          chmod -R u+w "$target" 2>/dev/null || true
+
           # 1. Decompress, rewrite, and deterministically recompress gzip files containing old hash
           find "$target" -type f -name '*.gz' 2>/dev/null | while IFS= read -r f; do
-              if gzip -dc "$f" 2>/dev/null | grep -q "$old" 2>/dev/null; then
+              if gzip -dc "$f" 2>/dev/null | grep -qF "$old" 2>/dev/null; then
                   chmod u+w "$(dirname "$f")" "$f" 2>/dev/null || true
                   if gzip -dc "$f" 2>/dev/null | sed "s|$old|$new|g" | gzip -n > "$f.tmp"; then
                       cat "$f.tmp" > "$f"
@@ -49,7 +72,7 @@ let
           done
 
           # 2. Rewrite regular files containing old hash in-place (preserving permissions)
-          find "$target" -type f ! -name '*.gz' -exec grep -l "$old" {} + 2>/dev/null | while IFS= read -r f; do
+          find "$target" -type f ! -name '*.gz' -exec grep -lF "$old" {} + 2>/dev/null | while IFS= read -r f; do
               chmod u+w "$(dirname "$f")" "$f" 2>/dev/null || true
               if sed "s|$old|$new|g" "$f" > "$f.tmp" 2>/dev/null; then
                   cat "$f.tmp" > "$f"
@@ -71,40 +94,10 @@ let
 
           # 4. Package-specific CASPER relocation rules
           ${relocateExtra}
+
+          nix-store --dump "$target"
           CASPER_RELOCATE_EOF
             chmod +x "$out/nix-support/relocate.sh"
-        ''
-        + prev.lib.optionalString (hashExtra != "") ''
-            cat << 'CASPER_HASH_EOF' > "$out/nix-support/hash.sh"
-          #!/bin/sh
-          export LC_ALL=C
-          set -e
-          if [ "$1" = "--blind-in-place" ]; then
-              target="$2"
-              old_self="$3"
-              blind_self="$4"
-              "$target/nix-support/relocate.sh" "$target" "$old_self" "$blind_self"
-              ${hashExtra}
-              exit 0
-          fi
-
-          target="''${1:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}"
-          base="''${2:-$(basename -- "$target")}"
-          name="''${base#????????????????????????????????-}"
-          blind="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-$name"
-
-          tmpdir=$(mktemp -d)
-          trap 'chmod -R u+w "$tmpdir" 2>/dev/null || true; rm -rf "$tmpdir"' EXIT
-          cp -a "$target" "$tmpdir/$base"
-          chmod -R u+w "$tmpdir/$base" 2>/dev/null || true
-          "$target/nix-support/relocate.sh" "$tmpdir/$base" "$base" "$blind"
-          (
-              target="$tmpdir/$base"
-              ${hashExtra}
-          )
-          "''${NIX_HASH_BIN:-nix-hash}" --type sha256 --truncate --base32 "$tmpdir/$base"
-          CASPER_HASH_EOF
-            chmod +x "$out/nix-support/hash.sh"
         ''
         + ''
           fi
