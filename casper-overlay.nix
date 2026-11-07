@@ -76,8 +76,10 @@ let
             for _casper_out in ''${outputs:-out}; do
               eval "_casper_dir=\$$_casper_out"
               if [ -n "$_casper_dir" ] && [ -d "$_casper_dir" ] && [ ! -e "$_casper_dir/nix-support/relocate.sh" ]; then
-                mkdir -p "$_casper_dir/nix-support"
-                ln -s ${casper-relocate}/bin/casper-relocate "$_casper_dir/nix-support/relocate.sh"
+                if [ -n "$(find "$_casper_dir" -type f -name '*.gz' -print -quit 2>/dev/null)" ]; then
+                  mkdir -p "$_casper_dir/nix-support"
+                  ln -s ${casper-relocate}/bin/casper-relocate "$_casper_dir/nix-support/relocate.sh"
+                fi
               fi
             done
           ''
