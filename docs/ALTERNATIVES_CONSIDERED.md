@@ -1,18 +1,18 @@
 # CASPER Alternatives Considered (and Why They Were Discarded)
 
-This document records the alternative design choices explored during the development of **CASPER (Content-Addressable Store via Partial-blinding and Embedded Relocation)** and explains why they were discarded in favor of the primary `NAR` $\to$ `NAR` stream relocation architecture described in [README.md](README.md).
+This document records the alternative design choices explored during the development of **CASPER (Content-Addressable Store via Partial-blinding and Embedded Relocation)** and explains why they were discarded in favor of the primary `NAR` $\to$ `NAR` stream relocation architecture described in [README.md](../README.md) and [DETAILS.md](DETAILS.md).
 
 ---
 
 ## 1. In-Place Directory Relocation (`relocate.sh <target-dir> <old-self> <new-self>`) (Discarded / Used in Initial Prototype)
 
-Before converging on the `NAR` $\to$ `NAR` stream transformer design ([README.md Section 2.2](README.md#22-relocatesh-as-a-nar-to-nar-stream-transformer-stdin-to-stdout)), the initial CASPER design and bootstrap prototype mutated `$out` in place on the filesystem via `relocate.sh <target-path> <old-self> <new-self>`:
+Before converging on the `NAR` $\to$ `NAR` stream transformer design ([DETAILS.md Section 2](DETAILS.md#2-relocatesh-as-a-nar-to-nar-stream-transformer-stdin-to-stdout)), the initial CASPER design and bootstrap prototype mutated `$out` in place on the filesystem via `relocate.sh <target-path> <old-self> <new-self>`:
 ```sh
 /bin/sh "$out/nix-support/relocate.sh" <target-path> <old-self> <new-self>
 ```
 
-- **Why Discarded in Favor of `NAR` $\to$ `NAR` ([README.md Section 2.2](README.md#22-relocatesh-as-a-nar-to-nar-stream-transformer-stdin-to-stdout))**:
-  1. **Host-`root` vs. Sandbox-User Filesystem Races**: Mutating `$out` in place on the host filesystem requires `chown`/`chmod` dances between the host `root` daemon and the sandbox `buildUser`, opening TOCTOU symlink and hardlink races (see [security.md](security.md)) and leaking filesystem metadata (`mtime`/`inode`) between passes.
+- **Why Discarded in Favor of `NAR` $\to$ `NAR` ([DETAILS.md Section 2](DETAILS.md#2-relocatesh-as-a-nar-to-nar-stream-transformer-stdin-to-stdout))**:
+  1. **Host-`root` vs. Sandbox-User Filesystem Races**: Mutating `$out` in place on the host filesystem requires `chown`/`chmod` dances between the host `root` daemon and the sandbox `buildUser`, opening TOCTOU symlink and hardlink races (see [SECURITY.md](SECURITY.md)) and leaking filesystem metadata (`mtime`/`inode`) between passes.
   2. **Redundant Disk I/O**: In-place mutation requires writing the blinded tree to disk, reading it back to hash it, and mutating it on disk a second time, whereas `NAR` $\to$ `NAR` pipes the blinded NAR stream directly into `HashSink(SHA256)` with zero disk writes.
 
 ### Prototype Default `$out/nix-support/relocate.sh` Script
@@ -67,12 +67,12 @@ fi
 ```
 
 ### Prototype Hybrid Sandbox + In-Process C++ Execution Flow
-Inside `UnixDerivationBuilderImpl` / `ChrootLinuxDerivationBuilder` and [`DerivationBuilderImpl::registerOutputs`](nix/src/libstore/build/derivation-builder-impl.cc#L604-L698):
+Inside `UnixDerivationBuilderImpl` / `ChrootLinuxDerivationBuilder` and [`DerivationBuilderImpl::registerOutputs`](../nix/src/libstore/build/derivation-builder-impl.cc#L604-L698):
 1. The builder child process runs inside the sandbox (with `sandboxMountNamespace` and `sandboxUserNamespace` preserved by `ChrootLinuxDerivationBuilder` until `cleanupBuild()`).
 2. In `registerOutputs()`, if the output is a directory, Nix ensures `$out/nix-support/relocate.sh` and `$out/nix-support/hash.sh` exist, recording `hasCustomRelocate = true` if the builder supplied its own `relocate.sh`.
 3. Nix checks `bool needRelocateScript = hasCustomRelocate || hasGzFiles(actualPath);`:
    - Whenever the package provides a custom `relocate.sh` or contains `.gz` files, Nix enters the saved sandbox namespaces (`sandboxMountNamespace`/`sandboxUserNamespace`) as the build user to execute `$out/nix-support/relocate.sh`.
-   - In all cases, Nix also runs its fast in-process C++ [`rewritePathInPlace`](nix/src/libstore/build/derivation-builder-impl.cc#L204-L243) on non-`.gz` regular files and symlinks.
+   - In all cases, Nix also runs its fast in-process C++ [`rewritePathInPlace`](../nix/src/libstore/build/derivation-builder-impl.cc#L204-L243) on non-`.gz` regular files and symlinks.
 4. The three-step blind-hash-relocate cycle proceeds as `<inputHash>-<name>` $\to$ `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-<name>` $\to$ `outHash = compressHash(hashPath(actualPath), 20)` $\to$ `<outHash>-<name>`, followed by `canonicalisePathMetaData` and `optimisePath`.
 
 ---
@@ -101,7 +101,7 @@ Inside `UnixDerivationBuilderImpl` / `ChrootLinuxDerivationBuilder` and [`Deriva
   2. **Standalone Post-Build Verification**: Running `$out/nix-support/hash.sh` on an installed `/nix/store/<output-hash>-<name>` reproduced `<output-hash>`.
 
 - **Why Discarded**:
-  1. **Opens the Hostile / Weak Hasher Security Hole (`echo <static-hash>`; see [security.md](security.md))**:
+  1. **Opens the Hostile / Weak Hasher Security Hole (`echo <static-hash>`; see [SECURITY.md](SECURITY.md))**:
      - If a derivation can bundle a custom `$out/nix-support/hash.sh` and Nix trusts its output as `<output-hash>`, a broken or hostile derivation (`evil-glibc`) can decouple **the digest Nix uses for the store path** from **the actual bytes in `$out`**.
      - Specifically, `evil-glibc` can predict legitimate `glibc-2.40-224`'s hash (`19zs62pdr843wg6gdlrv42pi9xsk7gin`), write `echo "19zs62pdr843wg6gdlrv42pi9xsk7gin"` in `hash.sh`, and install a malicious `libc.so.6` directly into `/nix/store/19zs62pdr843wg6gdlrv42pi9xsk7gin-glibc-2.40-224`.
      - Even if defended by requiring custom `hash.sh` to be a symlink to an external store dependency whose closure hash $H_{\text{closure}}$ is cryptographically combined with $H_{\text{content}}$ ($\text{SHA256}(H_{\text{closure}} \parallel H_{\text{content}})$), eliminating `hash.sh` altogether removes the attack surface completely.
