@@ -45,7 +45,7 @@ In the discarded design where a derivation could bundle a custom `$out/nix-suppo
 
 2. **Identical 32-Char `hashPart` Across Different Package Names (`SIGABRT` DoS in `PathRefScanSink`)**:
    - In [`StoreDirConfig::makeContentAddressedOutputPath`](../nix/src/libstore/store-dir-config.cc), `<outHash>` is currently computed purely from `compressHash(narHash, 20)` **without mixing in `name`**.
-   - As observed in the bootstrap ([README.md Section 3.3](../README.md#33-real-world-bootstrap-verification-casper-store)), `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-6.3.0-info` and `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-with-cxx-6.3.0-info` have different names (`gmp-6.3.0-info` vs. `gmp-with-cxx-6.3.0-info`) but the **exact same 32-character `hashPart`** (`j1zgcfidm58ay0zxcc724ciwxv6mwn91`). The same occurs whenever two packages produce identical or empty `-doc` directories.
+   - As observed in the bootstrap ([BOOTSTRAPPING_AND_PACKAGING.md Section 4](BOOTSTRAPPING_AND_PACKAGING.md#4-real-world-bootstrap-verification-casper-store)), `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-6.3.0-info` and `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-with-cxx-6.3.0-info` have different names (`gmp-6.3.0-info` vs. `gmp-with-cxx-6.3.0-info`) but the **exact same 32-character `hashPart`** (`j1zgcfidm58ay0zxcc724ciwxv6mwn91`). The same occurs whenever two packages produce identical or empty `-doc` directories.
    - However, Nix's reference scanner in [`PathRefScanSink::fromPaths`](../nix/src/libstore/path-references.cc#L20-L33) assumes every `StorePath` has a globally unique 32-character `hashPart`:
      ```cpp
      for (auto & i : refs) {

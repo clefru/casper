@@ -1,6 +1,6 @@
 # CASPER Detailed Architecture
 
-This document describes the detailed end-to-end operational pipeline, the `NAR` $\to$ `NAR` stream relocation contract, and downstream dependency rewriting for **CASPER (Content-Addressable Store via Partial-blinding and Embedded Relocation)** (see [README.md](../README.md), [NIX_IMPLEMENTATION.md](NIX_IMPLEMENTATION.md), [SECURITY.md](SECURITY.md), and [ALTERNATIVES_CONSIDERED.md](ALTERNATIVES_CONSIDERED.md)).
+This document describes the detailed end-to-end operational pipeline, the `NAR` $\to$ `NAR` stream relocation contract, and downstream dependency rewriting for **CASPER (Content-Addressable Store via Partial-blinding and Embedded Relocation)** (see [README.md](../README.md), [BOOTSTRAPPING_AND_PACKAGING.md](BOOTSTRAPPING_AND_PACKAGING.md), [NIX_IMPLEMENTATION.md](NIX_IMPLEMENTATION.md), [SECURITY.md](SECURITY.md), and [ALTERNATIVES_CONSIDERED.md](ALTERNATIVES_CONSIDERED.md)).
 
 ---
 

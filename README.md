@@ -1,145 +1,112 @@
 # CASPER: Content-Addressable Store via Partial-blinding and Embedded Relocation
 
-## 1. Overview & Motivation
-
-### 1.1 The Blocker to Output-Addressed Derivations: The Self-Reference Hash Loop
-In traditional Nix, derivation outputs are **input-addressed**: a derivation with masked input hash `abcdef...` builds its output directly into `/nix/store/abcdef...-foo-1.2.3`, and that path is registered in the store regardless of the actual bytes produced. Two derivations with different inputs that compile to the exact same output cannot share a store path or short-circuit downstream rebuilds.
-
-Nix has long sought to move to **output-addressed (content-addressed) derivations**, where every built object in `/nix/store` is named by the cryptographic hash of its output contents (`/nix/store/<output-hash>-<name>`). However, **self-referencing outputs** are the natural blocker:
-- Over **54.9%** of packages (and **72.2%** by store size; see [empirical-analysis.md](empirical-analysis.md)) embed their own `$out` store path inside their build outputs—in ELF `DT_RUNPATH`s, shebangs, wrapper scripts, `pkg-config` `.pc` files, Python `.pyc` bytecode, and even inside compressed files such as `.gz` manpages.
-- During the build, `$out` must already be known so compilers and build scripts can embed `/nix/store/<hash>-<name>` into binaries and data files.
-- Yet if `<hash>` is the cryptographic hash of the output, then the output's contents must contain `<hash>` before `<hash>` can be computed—an **unsolvable cryptographic hash loop**:
-  $$H = \text{Hash}\big(\text{output containing } \texttt{/nix/store/} \parallel H \parallel \texttt{-foo}\big)$$
-
-### 1.2 Why Store Symlinks Are Not Enough
-One way to sidestep the self-reference loop without rewriting package contents is to build in the original input-addressed path `/nix/store/<input-hash>-<name>`, move the result to `/nix/store/<output-hash>-<name>`, and replace the original input-addressed path `/nix/store/<input-hash>-<name>` with a **symlink** to `/nix/store/<output-hash>-<name>`.
-- **Why this is undesirable**:
-  1. **Double Filesystem Lookups on Every Access**: Every `execve`, shared library load (`openat` via `DT_RUNPATH`), header include, or file read through `/nix/store/<input-hash>-<name>` requires **two filesystem lookups** (first resolving the input-hash symlink, then traversing the target output-addressed directory). On cold storage, spinning disks, overlayfs, or network/remote stores, doubling every filesystem lookup slows down execution and builds considerably.
-  2. **Leaky Input-Hash Pollution**: Binaries still embed `<input-hash>` rather than `<output-hash>`, so two builds producing identical functional content still differ at the byte level in their embedded paths, and `/nix/store` accumulates permanent symlink stubs for every historical input hash.
-
-### 1.3 The CASPER Approach: Partial Blinding & Embedded Relocation
-
-**CASPER (Content-Addressable Store via Partial-blinding and Embedded Relocation)** resolves the self-reference hash loop directly through two core ideas:
-
-1. **Breaking the Hash Loop via Partial Blinding**:
-   - Whenever a payload must embed a cryptographic hash or signature of itself, standard cryptographic protocols break the circularity by computing the digest over a **blinded** representation of the payload in which the hash/signature slot is either stripped or overwritten with a fixed placeholder (such as all zeros or `xxxx...`):
-     - In **cryptocurrency transactions** (e.g., Bitcoin's `SIGHASH` and Ethereum transaction signing), the `scriptSig` or signature fields are zeroed/blanked before hashing the transaction payload to be signed, and the resulting signature is then placed into those fields.
-     - In **signed API requests, JWTs, and XML-DSig / SAML enveloped signatures**, as well as **PE Authenticode binaries**, **RPM/FIT images**, and **IPv4/TCP/ICMP packets**, the embedded signature or checksum field is zeroed out before the hash is computed over the payload.
-   - We call this **partial blinding**: only the self-reference slots inside the derivation output are overwritten with a fixed placeholder (while all external dependency references `/nix/store/<dep-hash>-<dep>` remain unblinded).
-   - In CASPER, an output's content address `<output-hash>` is defined not as the raw SHA-256 hash of the final output, but as the SHA-256 hash of the **partially blinded** output. Because the placeholder is independent of both `<input-hash>` and `<output-hash>`, the hash loop disappears, and two derivations with different input hashes that produce identical blinded content converge to the exact same `<output-hash>`.
-
-2. **Delegating Partial Blinding & Relocation to the Derivation Itself (Embedded Relocation)**:
-   - Why can't Nix simply perform partial blinding in C++ using a naive byte-string search-and-replace? Because in real software packages, self-references are not always stored in uncompressed plaintext. Consider a `.gz`-compressed manpage or archive inside `$out` that embeds `/nix/store/<input-hash>-<name>`: a naive byte-string blinder scanning raw file bytes will never see the reference inside the compressed Deflate bitstream and therefore cannot blind or relocate it.
-   - While we could special-case `.gz` files in Nix itself, this is undesirable as so many versions of hidden references could exist. It is up to the software packager to fix those up.
-   - CASPER's second invention is to **delegate the task of blinding and relocating self-references to the derivation output itself**, by embedding a relocator (`$out/nix-support/relocate.sh`) inside the output.
-   - Crucially, embedding the blinder/relocator inside the output **does not re-introduce the hash loop**: the task of blinding and relocating can be defined **abstractly** (`relocate.sh <old-self> <new-self>`, taking the source and target store-path strings as parameters) without making any concrete reference to `<input-hash>` or `<output-hash>` inside the script itself. Because the relocator's own bytes remain completely invariant across blinding and relocation, it can live inside `$out` and be hashed alongside the rest of the partially blinded output without causing a hash cycle.
-
-### 1.4 High-Level Design Choices
-
-1. **`relocate.sh` as a Sandboxed `NAR` $\to$ `NAR` Stream Transformer (`stdin` $\to$ `stdout`)**:
-   - Rather than mutating a directory tree in place on the host filesystem, `$out/nix-support/relocate.sh <old-self> <new-self>` runs inside an isolated sandbox with **zero host filesystem access**, reading an input Nix Archive (NAR) stream from `stdin` and writing the relocated NAR stream to `stdout`.
-   - During **Pass 1 (blinding)**, `stdout` is piped directly into Nix's C++ SHA-256 `HashSink` with zero disk writes to derive `<output-hash>`. During **Pass 2 (relocation)**, the trusted outer layer (`nix-daemon`) unpacks `stdout` into `/nix/store/<output-hash>-<name>` while simultaneously computing the final `narHash` and scanning for store references, followed by **Pass 3 (fixed-point verification)**, which re-blinds the unpacked output (`<output-hash>-<name>` $\to$ `<blind-hash>-<name>`) and verifies that the blinded hash is a fixed point.
-2. **Blinding Constant Derived from the Relocator's Own Hash**:
-   - Whenever `$out/nix-support/relocate.sh` is present, it is required to be a symlink pointing to a standalone relocator derivation (`/nix/store/<relocator-hash>-<relocator-name>/...`).
-   - Nix extracts `<relocator-hash>` directly from the `relocate.sh` symlink target and uses `<relocator-hash>-<name>` as the blinding constant (`blindSelf`).
-   - This forces an **unsolvable cryptographic hash loop** into the relocator itself: for a relocator to anticipate or hardcode its blinding constant (e.g., to branch differently between Pass 1 and Pass 2), it would have to embed its own SHA-256 store hash inside its own binary or script before being hashed. Because `<relocator-hash>` remains visible on the `relocate.sh` symlink inside the final store path, `nix-hash --casper` (`nix hash casper`) can also independently recompute and verify any `/nix/store/<output-hash>-<name>` offline.
-3. **Downstream Dependency Rewriting**:
-   - When a dependency `foo` is relocated from its evaluation-time path `/nix/store/<input-hash>-foo` to `/nix/store/<output-hash>-foo`, Nix records the mapping in SQLite (`PathRewrites` / `DerivationOutputs`).
-   - Before building any downstream derivation `bar`, Nix rewrites `<input-hash>-foo` $\to$ `<output-hash>-foo` across `bar`'s builder arguments, environment variables, structured attributes, and sandbox inputs. Downstream derivations build directly against `/nix/store/<output-hash>-foo`, so no symlink stubs in `/nix/store` are needed.
-
-### 1.5 Further Documentation
-- **[Detailed Architecture (`docs/DETAILS.md`)](docs/DETAILS.md)**: End-to-end operational pipeline, `NAR` $\to$ `NAR` stream protocol, and multi-output/downstream dependency rewriting.
-- **[Nix C++ Implementation Overview (`docs/NIX_IMPLEMENTATION.md`)](docs/NIX_IMPLEMENTATION.md)**: Summary of modified C++ files in the [`nix/`](nix) submodule.
-- **[Security Considerations & Threat Model (`docs/SECURITY.md`)](docs/SECURITY.md)**: Sandbox threat model, prototype vulnerabilities, dynamic `<relocator-hash>` blinding construction, and Pass 3 fixed-point verification.
-- **[Alternatives Considered (`docs/ALTERNATIVES_CONSIDERED.md`)](docs/ALTERNATIVES_CONSIDERED.md)**: Discarded design alternatives (in-place directory mutation, separate `hash.sh`, `/nix/build`, and `.`-prefixed store paths).
+**CASPER** brings output-addressed (content-addressed) builds to Nix without `/nix/store` symlink stubs and without hardcoding file-format knowledge into Nix C++.
 
 ---
 
-## 2. Reflections, Packaging Trade-offs & Verification Tricks
+## 1. Core Innovations of CASPER
 
-*(For discarded design alternatives, see [docs/ALTERNATIVES_CONSIDERED.md](docs/ALTERNATIVES_CONSIDERED.md); for security considerations, threat models, prototype vulnerabilities, and relocator invariants, see [docs/SECURITY.md](docs/SECURITY.md)).*
+### 1.1 Breaking the Self-Reference Hash Loop via Partial Blinding
+- Whenever a payload must embed a cryptographic hash or signature of itself, standard cryptographic protocols break the circularity by computing the digest over a **blinded** representation of the payload in which the hash/signature slot is either stripped or overwritten with a fixed placeholder (such as all zeros or `xxxx...`):
+  - In **cryptocurrency transactions** (e.g., Bitcoin's `SIGHASH` and Ethereum transaction signing), the `scriptSig` or signature fields are zeroed/blanked before hashing the transaction payload to be signed, and the resulting signature is then placed into those fields.
+  - In **signed API requests, JWTs, and XML-DSig / SAML enveloped signatures**, as well as **PE Authenticode binaries**, **RPM/FIT images**, and **IPv4/TCP/ICMP packets**, the embedded signature or checksum field is zeroed out before the hash is computed over the payload.
+- We call this **partial blinding**: only the self-reference slots (`/nix/store/<input-hash>-<name>`) inside the derivation output are overwritten with a blinding placeholder (`/nix/store/<blind-hash>-<name>`), while all external dependency references (`/nix/store/<dep-hash>-<dep>`) remain unblinded.
+- In CASPER, an output's content address `<output-hash>` is defined not as the raw SHA-256 hash of the final output, but as the SHA-256 hash of the **partially blinded** output. Because the placeholder is independent of both `<input-hash>` and `<output-hash>`, the hash loop disappears, and two derivations with different input hashes that produce identical blinded content converge to the exact same `<output-hash>`.
 
-### 2.1 The Packaging Drawback: Maintaining `relocate.sh` for Opaque Formats
-- In CASPER, package maintainers have the added responsibility of thinking about `relocate.sh` during packaging.
-- Plaintext and standard ELF binary self-references are easy to spot with `grep` and are handled automatically by `sed` in the default `relocate.sh`.
-- However, self-references buried inside compressed or encoded formats—such as `.gz` files (handled by default), `.xz`/`.zst` archives, `.zip`/`.jar`/`.whl` archives, SQLite databases, or custom binary caches—are invisible to a naive `grep`. Spotting and rewriting these references normally requires package-specific domain knowledge so the packager can extend `relocate.sh` to unpack, rewrite, and repack those files.
+### 1.2 Delegating Partial Blinding & Relocation to the Derivation (`$out/nix-support/relocate.sh`)
+- Why can't Nix simply perform partial blinding in C++ using a naive byte-string search-and-replace? Because in real software packages, self-references are not always stored in uncompressed plaintext. Consider a `.gz`-compressed manpage or archive inside `$out` that embeds `/nix/store/<input-hash>-<name>`: a naive byte-string blinder scanning raw file bytes will never see the reference inside the compressed Deflate bitstream and therefore cannot blind or relocate it.
+- While we could special-case `.gz` files in Nix itself, this is undesirable as so many versions of hidden references could exist. It is up to the software packager to fix those up.
+- CASPER's second invention is to **delegate the task of blinding and relocating self-references to the derivation output itself**, by embedding a relocator (`$out/nix-support/relocate.sh`) inside the output.
+- Crucially, embedding the blinder/relocator inside the output **does not re-introduce the hash loop**: the task of blinding and relocating can be defined **abstractly** (`relocate.sh <old-self> <new-self>`, taking the source and target store-path strings as parameters) without making any concrete reference to `<input-hash>` or `<output-hash>` inside the script itself. Because the relocator's own bytes remain completely invariant across blinding and relocation, it can live inside `$out` and be hashed alongside the rest of the partially blinded output without causing a hash cycle.
 
-### 2.2 Trick for Deterministic Packages: Dual-Location Rebuild to Detect Incomplete `relocate.sh`
-- For **fully deterministic packages** (packages that always produce the exact same output byte stream given identical inputs and build environment), we can automatically detect hidden, unrelocated self-references *without* needing prior knowledge of the package's file formats:
-  1. **Build 1**: Build the package in its normal scratch location `/nix/store/<input-hash>-foo`, run `relocate.sh` to blind `/nix/store/<input-hash>-foo` $\to$ `/nix/store/<blind-hash>-foo`, and compute the blinded output hash $H_1$.
-  2. **Build 2 (`-recheck`)**: Rebuild the exact same derivation into a different output location—for example, `/nix/store/<input-hash>-foo-recheck` (or an alternate scratch hash).
-  3. Run `relocate.sh` on the second build to blind `/nix/store/<input-hash>-foo-recheck` $\to$ `/nix/store/<blind-hash>-foo`, and compute the blinded output hash $H_2$.
-  4. **Compare $H_1$ vs. $H_2$**:
-     - If `relocate.sh` caught **every** self-reference, both blinded trees will be byte-for-byte identical and $H_1 = H_2$.
-     - If the build embedded `$out` inside an unhandled format (e.g., an `.xz` archive or binary cache that `relocate.sh` did not unpack), the `-recheck` suffix remains inside that file after `relocate.sh` runs, causing $H_1 \neq H_2$.
-     - Comparing the two blinded trees immediately alerts the packager to the incomplete `relocate.sh` and pinpoints the exact file containing the hidden self-reference.
+### 1.3 Sandboxed `NAR` $\to$ `NAR` Stream Relocation (`stdin` $\to$ `stdout`)
+- Instead of mutating a directory tree in place on the host filesystem, `relocate.sh <old-self> <new-self>` runs inside an isolated sandbox (`CLONE_NEWUSER`, `CLONE_NEWNS`, `CLONE_NEWNET`, seccomp/Landlock) as a pure **`NAR` (`stdin`) $\to$ `NAR` (`stdout`) stream transformer** with zero host filesystem access:
+  - **Pass 1 (Blinding & Hashing)**: Nix serializes `$out` as a NAR stream, pipes it through `relocate.sh "<input-hash>-<name>" "<blind-hash>-<name>"`, and feeds `stdout` directly into Nix's C++ SHA-256 `HashSink` with **zero disk writes** to derive `<output-hash>`.
+  - **Pass 2 (Relocation & Trusted Unpacking)**: Nix pipes the blinded NAR through `relocate.sh "<blind-hash>-<name>" "<output-hash>-<name>"` and unpacks `stdout` via its trusted C++ `RestoreSink` to `/nix/store/<output-hash>-<name>` while simultaneously computing the final `narHash` and scanning store references.
+  - **Pass 3 (Fixed-Point Verification)**: Immediately after unpacking, Nix re-blinds `/nix/store/<output-hash>-<name>` back to `<blind-hash>-<name>` and verifies that the SHA-256 hash matches Pass 1—proving at build time that `<output-hash>` is a true fixed point.
+
+### 1.4 Unsolvable Hash Loop for the Relocator via Dynamic Blinding Constant
+- Whenever `$out/nix-support/relocate.sh` is present, it is required to be a **symlink pointing to a standalone relocator derivation** (`/nix/store/<relocator-hash>-<relocator-name>/...`).
+- Nix extracts `<relocator-hash>` directly from the `relocate.sh` symlink target and uses `<relocator-hash>-<name>` as the blinding constant (`blindSelf`).
+- This forces an **unsolvable cryptographic hash loop** into the relocator itself: for a relocator to anticipate or hardcode its blinding constant (for example, to branch differently between Pass 1 and Pass 2), it would have to embed its own SHA-256 store hash inside its own binary or script before being hashed.
+
+### 1.5 Downstream Dependency Rewriting (Zero Store Symlinks)
+- When a dependency `foo` is relocated from `/nix/store/<input-hash>-foo` to `/nix/store/<output-hash>-foo`, Nix records the mapping in SQLite (`PathRewrites` and `DerivationOutputs`).
+- Before building any downstream derivation `bar`, Nix rewrites `<input-hash>-foo` $\to$ `<output-hash>-foo` across `bar`'s builder arguments, environment variables, structured attributes, and sandbox inputs so `bar` builds directly against `/nix/store/<output-hash>-foo`.
 
 ---
 
-## 3. Nixpkgs Bootstrapping & Lightweight Overlay Strategy
+## 2. Quickstart & How to Use CASPER
 
-### 3.1 Format-Agnostic Built-In `relocateNAR` + Symlinked `casper-relocate` in `casper-overlay.nix`
-- **Format-Agnostic C++ Fallback (`relocateNAR`)**:
-  - During the early `stdenv` bootstrap (`minimal-bootstrap` and `bootstrap-stage0` through `bootstrap-stage4`), derivations do not embed self-references in `.gz` files (0 outputs in `casper-store`'s bootstrap closure had direct self-references in `.gz` files), and early stages execute in a minimal environment before `glibc.static` and `zlib.static` are available.
-  - Nix C++'s built-in [`relocateNAR`](nix/src/libstore/build/derivation-builder-impl.cc#L108-L240) is strictly format-agnostic: it streams `NAR` $\to$ `NAR` in $O(1)$ memory for uncompressed files, symlinks, and directory entry names when no `$out/nix-support/relocate.sh` is present.
-- **Standalone Gzip-Capable `casper-relocate` Binary & Direct Symlink in [`casper-overlay.nix`](casper-overlay.nix)**:
-  - Once `stdenv` reaches its final stage, [`casper-overlay.nix`](casper-overlay.nix) builds [`casper-relocate`](casper-relocate.c) as a standalone, statically-linked C binary (`-static -lz`, ~760 KB, with `allowedReferences = []` and zero runtime store dependencies) that streams `NAR` $\to$ `NAR` (`stdin` $\to$ `stdout`), rewriting uncompressed regular files, symlinks, directory entry names, and `.gz`-compressed files (`zlib` `15 + 16` gzip format with deterministic `mtime = 0, os = 3` headers).
-  - For every derivation built with `stdenv.mkDerivation` (or wrapped with `withCasper`), [`casper-overlay.nix`](casper-overlay.nix):
-    1. Checks each directory output (`${outputs:-out}`) for `.gz` files (`find "$_casper_dir" -type f -name '*.gz' -print -quit`) and creates a direct symlink `$_casper_dir/nix-support/relocate.sh -> ${casper-relocate}/bin/casper-relocate` **only when `.gz` files are present**—allowing outputs without `.gz` files to use the fast in-process C++ `relocateNAR` with zero extra files or references.
-    2. Automatically extends `allowedReferences`, `allowedRequisites`, and `outputChecks.<out>.{allowedReferences,allowedRequisites}` with `casper-relocate` via `extendRefChecks`.
-  - When a package requires additional custom relocation rules (e.g., `.xz`/`.zst` archives or Python `RECORD` files), `withCasper { relocateExtra = "..."; }` builds a standalone custom relocator derivation (`casper-relocate-<name>`) and symlinks `$out/nix-support/relocate.sh -> ${customReloc}/bin/casper-relocate`:
+### 2.1 Building CASPER Nix
+
+Compile the modified Nix implementation in the [`nix/`](nix) submodule:
+
+```bash
+meson compile -C nix/build
+```
+
+The resulting binaries (`nix`, `nix-build`, `nix-store`, `nix-hash`, etc.) are placed in `nix/build/src/nix/`.
+
+---
+
+### 2.2 Building Nixpkgs Packages with `casper-overlay.nix`
+
+[`casper-overlay.nix`](casper-overlay.nix) provides a lightweight Nixpkgs overlay that builds [`casper-relocate`](casper-relocate.c) (a statically-linked C `NAR` $\to$ `NAR` stream relocator handling uncompressed files, symlinks, directory entries, and `.gz` files) and symlinks `$out/nix-support/relocate.sh -> ${casper-relocate}/bin/casper-relocate` whenever an output contains `.gz` files. Outputs without `.gz` files use Nix's built-in format-agnostic C++ `relocateNAR` with zero extra files.
+
+#### Build a Single Package or Closure
+
+```bash
+./nix/build/src/nix/nix-build \
+  --store "$PWD/casper-store" \
+  -E 'import <nixpkgs> { overlays = [ (import ./casper-overlay.nix) ]; }' \
+  -A hello
+```
+
+> [!TIP]
+> **Incremental vs. Full Bootstrap**: You do not need to rebuild `stdenv` from scratch to use CASPER. Pre-existing store paths without a `PathRewrites` entry act as fixed leaves (`resolveInputPath` returns them unchanged), while newly built derivations are blinded, content-addressed, and relocated by CASPER.
+
+#### Run the Full From-Scratch Bootstrap (`stage0-posix` + `stdenv`)
+
+```bash
+./bootstrap.sh
+```
+
+Running [`bootstrap.sh`](bootstrap.sh) builds both `minimal-bootstrap.kaem` (49 derivations from `hex0`) and the full Nixpkgs `stdenv` (`stage0` $\to$ `stage4` $\to$ `stdenv` $\to$ `hello`, 264 derivations) into `./casper-store`, relocating **313 derivation outputs** and automatically deduplicating **20 cross-stage output groups** into **274 unique content-addressed store paths** (see [docs/BOOTSTRAPPING_AND_PACKAGING.md](docs/BOOTSTRAPPING_AND_PACKAGING.md#4-real-world-bootstrap-verification-casper-store)).
+
+---
+
+### 2.3 Verifying Store Paths Offline (`nix-hash --casper` / `nix hash casper`)
+
+Because `<relocator-hash>` is preserved on the `$out/nix-support/relocate.sh` symlink inside the final store object, you can independently recompute and verify the content address of any `/nix/store/<output-hash>-<name>` path without needing the `.drv` or SQLite database:
+
+```bash
+# Legacy CLI:
+./nix/build/src/nix/nix-hash --casper \
+  --store "$PWD/casper-store" \
+  /nix/store/sn0pwh1agh2hnlbgm61ra3qr6yiz6ja8-hello-2.12.2
+
+# Modern CLI:
+./nix/build/src/nix/nix --extra-experimental-features nix-command \
+  hash casper --store "$PWD/casper-store" \
+  /nix/store/sn0pwh1agh2hnlbgm61ra3qr6yiz6ja8-hello-2.12.2
+```
+
+`nix-hash --casper` locates `$out/nix-support/relocate.sh`, extracts `<relocator-hash>` from the symlink target, blinds `<output-hash>-<name>` $\to$ `<relocator-hash>-<name>`, hashes the resulting NAR stream with SHA-256, and verifies that the recomputed `casper:out` store path matches `/nix/store/<output-hash>-<name>`.
+
+---
+
+### 2.4 Custom Relocators for Opaque Formats (`withCasper`)
+
+When a package embeds self-references inside an opaque format beyond `.gz` (such as `.zst`/`.xz` archives or Python `RECORD` manifests), wrap the package with `withCasper` from [`casper-overlay.nix`](casper-overlay.nix). `withCasper` builds a standalone relocator derivation (`casper-relocate-<name>`) and symlinks it at `$out/nix-support/relocate.sh`:
 
 ```nix
 final: prev:
 let
-  # Helper to build a custom NAR -> NAR relocator derivation and symlink it at $out/nix-support/relocate.sh
-  withCasper = { relocateExtra ? "", relocateStream ? "" }: pkg:
-    let
-      customReloc = prev.stdenv.mkDerivation {
-        name = "casper-relocate-${pkg.pname or pkg.name or "custom"}";
-        dontUnpack = true;
-        dontFixup = true;
-        buildCommand = ''
-          mkdir -p "$out/bin"
-          cat << 'EOF' > "$out/bin/casper-relocate"
-          #!/bin/sh
-          set -e
-          old="$1"
-          new="$2"
-          workdir=$(mktemp -d)
-          trap 'chmod -R u+w "$workdir" 2>/dev/null || true; rm -rf "$workdir"' EXIT
-          target="$workdir/root"
-          nix-store --restore "$target" < <(
-            ${casper-relocate}/bin/casper-relocate "$old" "$new"
-          )
-          chmod -R u+w "$target" 2>/dev/null || true
-          ${relocateExtra}
-          nix-store --dump "$target"
-          EOF
-          chmod +x "$out/bin/casper-relocate"
-        '';
-      };
-    in pkg.overrideAttrs (old: {
-      postFixup = (old.postFixup or "") + prev.lib.optionalString (relocateExtra != "") ''
-        mkdir -p "$out/nix-support"
-        ln -sfn ${customReloc}/bin/casper-relocate "$out/nix-support/relocate.sh"
-      '';
-    });
-in {
-  # Example 1: Python packages with PEP 376 RECORD files storing SHA-256 hashes of scripts
-  python3 = prev.python3.override {
-    packageOverrides = pyFinal: pyPrev:
-      prev.lib.mapAttrs (name: pkg:
-        withCasper {
-          relocateExtra = ''
-            # Strip SHA-256 digests in *.dist-info/RECORD after shebang/path relocation
-            find "$target" -path "*.dist-info/RECORD" -exec sed -i 's|,sha256=[^,]*,|,,|g' {} +
-          '';
-        } pkg
-      ) pyPrev;
-  };
-
-  # Example 2: Packages with .zst or .xz compressed assets containing self-references
+  casperOverlay = import ./casper-overlay.nix final prev;
+  inherit (casperOverlay) withCasper;
+in casperOverlay // {
+  # Example 1: Directory-based custom hook (unpacks NAR in sandbox tmpfs, runs hook, dumps NAR)
   someZstPackage = withCasper {
     relocateExtra = ''
       find "$target" -type f -name "*.zst" | while IFS= read -r zf; do
@@ -148,104 +115,41 @@ in {
       done
     '';
   } prev.someZstPackage;
+
+  # Example 2: Pure NAR -> NAR stream filter hook (stdin -> stdout)
+  someStreamPackage = withCasper {
+    relocateStream = ''
+      exec ${final.casper-relocate}/bin/casper-relocate "$old" "$new"
+    '';
+  } prev.someStreamPackage;
 }
 ```
 
-> [!TIP]
-> Notice `cat << 'EOF'` uses `#!/bin/sh` rather than `${prev.runtimeShell}` (`#!/nix/store/...-bash/bin/bash`). This ensures the custom script does not introduce an unwanted runtime store dependency on `bash` for data-only or minimal-closure outputs.
+---
 
-### 3.2 Bootstrapping Strategies: Incremental vs. Full `stdenv` Bootstrap
+## 3. Background: Why Self-References Block Content-Addressed Nix
 
-#### Mode A: Incremental Bootstrap on Top of an Existing `/nix/store` (Fastest)
-- You do **not** have to rebuild `stdenv` from stage 0 just to start using CASPER with `nixpkgs`:
-  - `localStore.resolveInputPath(inputPath)` in [`local-store.cc`](nix/src/libstore/local-store.cc#L1838-L1854) returns `inputPath` unchanged whenever a store path has no entry in the `PathRewrites` SQLite table.
-  - Therefore, pre-existing store paths in `/nix/store` (or paths substituted from `cache.nixos.org`) act as fixed leaves, while every **newly built** derivation goes through CASPER's streaming `NAR` $\to$ `NAR` blinding, content-hashing, and relocation.
+### 3.1 The Self-Reference Hash Loop
+In traditional Nix, derivation outputs are **input-addressed**: a derivation with masked input hash `abcdef...` builds its output directly into `/nix/store/abcdef...-foo-1.2.3`, and that path is registered in the store regardless of the actual bytes produced. Two derivations with different inputs that compile to the exact same output cannot share a store path or short-circuit downstream rebuilds.
 
-#### Mode B: Full End-to-End `stdenv` Bootstrap from `bootstrap-tools`
-When bootstrapping `nixpkgs` from scratch (`stdenvStages` 0 through final `stdenv`):
-1. **Stage 0 (`bootstrap-tools`)**:
-   - Downloaded as a fixed-output derivation (`CAFixed`), unpacked by `busybox` (`unpack-bootstrap-tools.sh`), and relocated in-process by C++ [`relocateNAR`](nix/src/libstore/build/derivation-builder-impl.cc#L108-L273) without requiring any external tools in the sandbox.
-2. **Static Libraries (`.a` Archives) Across Bootstrap Stages (`stage0` $\to$ `stage1` $\to$ `stage2` $\to$ `stage3` $\to$ `stdenv`)**:
-   - Early GCC/glibc bootstrap stages build static `.a` archives (`libgcc.a`, `libc.a`).
-   - Standard `ar` archives store each member's byte size as a fixed-width decimal ASCII header and do not store member checksums. Because `<inputHash>` (32 chars), `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` (32 chars), and `<outHash>` (32 chars) have the exact same byte length, `RewritingSink` relocation inside `.a` archives preserves member sizes and symbol tables without needing `ranlib`.
-3. **Ecosystem-Level Hooks for Full Nixpkgs Coverage**:
-   - Rather than overriding individual packages one by one, most non-plaintext formats in `nixpkgs` belong to language/framework ecosystems where a single hook covers thousands of packages:
-     - **Python (`buildPythonPackage`)**: `*.dist-info/RECORD` files list SHA-256 hashes of installed entry-point scripts; when `relocate.sh` rewrites `$out` inside an entry-point script, `RECORD` either needs its hash updated or stripped.
-     - **Haskell (`ghc` / `cabal`)**: `package.conf.d/package.cache` is a binary cache of `.conf` files containing `$out` paths; `relocate.sh` for GHC package DBs can re-run `ghc-pkg recache` or rewrite the binary cache.
-     - **Linux Kernel Modules (`linux`)**: `.ko.xz` or `.ko.zst` modules that embed `$out` firmware/module paths need `xz`/`zstd` decompression/recompression in `relocate.sh`.
-     - **Java / JVM (`.jar` / `.zip`)**: Unpacking/repacking `.jar` files only when `grep` detects a self-reference inside the uncompressed stream.
-     - **macOS (`darwin`)**: Mach-O binaries with ad-hoc code signatures invalidate their signature when rewriting the `LC_RPATH` load command, requiring `codesign -f -s -` in `relocate.sh` on Darwin.
+Moving to **output-addressed (content-addressed) derivations**, where every built object in `/nix/store` is named by the cryptographic hash of its output contents (`/nix/store/<output-hash>-<name>`), runs directly into **self-referencing outputs**:
+- Over **54.9%** of packages (and **72.2%** by store size; see [docs/EMPIRICAL_ANALYSIS.md](docs/EMPIRICAL_ANALYSIS.md)) embed their own `$out` store path inside their build outputs—in ELF `DT_RUNPATH`s, shebangs, wrapper scripts, `pkg-config` `.pc` files, Python `.pyc` bytecode, and compressed files such as `.gz` manpages.
+- During the build, `$out` must already be known so compilers and build scripts can embed `/nix/store/<hash>-<name>` into binaries and data files.
+- Yet if `<hash>` is the cryptographic hash of the output, then the output's contents must contain `<hash>` before `<hash>` can be computed—an **unsolvable cryptographic hash loop**:
+  $$H = \text{Hash}\big(\text{output containing } \texttt{/nix/store/} \parallel H \parallel \texttt{-foo}\big)$$
 
-### 3.3 Real-World Bootstrap Verification (`casper-store`)
-Both Nixpkgs bootstrap chains were executed end-to-end into `casper-store` using `./nix/build/src/nix/nix-build` and [`casper-overlay.nix`](casper-overlay.nix), producing **313 relocated derivation outputs** (`PathRewrites` rows in `casper-store/nix/var/nix/db/db.sqlite`) that converged to **274 unique content-addressed outputs**:
+### 3.2 Why Store Symlink Stubs Are Not Enough
+One way to sidestep the self-reference loop without rewriting package contents is to build in `/nix/store/<input-hash>-<name>`, move the result to `/nix/store/<output-hash>-<name>`, and leave a **symlink** at `/nix/store/<input-hash>-<name> -> /nix/store/<output-hash>-<name>`. This is undesirable for two reasons:
+1. **Double Filesystem Lookups on Every Access**: Every `execve`, shared library load (`openat` via `DT_RUNPATH`), header include, or file read through `/nix/store/<input-hash>-<name>` requires **two filesystem lookups** (first resolving the input-hash symlink, then traversing the target output-addressed directory). On cold storage, spinning disks, overlayfs, or network/remote stores, doubling every filesystem lookup slows down execution and builds considerably.
+2. **Leaky Input-Hash Pollution**: Binaries still embed `<input-hash>` rather than `<output-hash>`, so two builds producing identical functional content still differ at the byte level in their embedded paths, and `/nix/store` accumulates permanent symlink stubs for every historical input hash.
 
-1. **Source-Only `stage0-posix` Bootstrap (49 Derivations)**:
-   - Built from `hex0-1.6.0` (`stage0-posix-1.6.0-source`) through `hex1`, `hex2`, `catm`, `M0`, `cc_arch`, `M2-0`, `M2`, `blood-elf-0`, `M1-0`, `hex2-1`, `M1`, `hex2`, `kaem-unwrapped`, `mescc-tools`, `mescc-tools-extra`, and `kaem-1.6.0` (`/nix/store/5ac8fyvhhjj13m4r54kc53b6bbhy7nfw-kaem-1.6.0`).
-2. **Full Nixpkgs `stdenv` Bootstrap (`stage0` $\to$ `stage1` $\to$ `stage-xgcc` $\to$ `stage2` $\to$ `stage3` $\to$ `stage4` $\to$ `stdenv-linux` $\to$ `hello-2.12.2`)**:
-   - **264 `stdenv` bootstrap outputs** built, blinded, content-hashed, and relocated across all bootstrap stages via the streaming `NAR` $\to$ `NAR` pipeline without a single Nixpkgs package modification.
+---
 
-#### Key Bootstrap Milestones (`inputPath` $\to$ Content-Addressed `outputPath`)
+## 4. Documentation
 
-| Stage / Milestone | Evaluation Input Path (`<inputHash>-<name>`) | Relocated Content-Addressed Path (`<outHash>-<name>`) |
-| :--- | :--- | :--- |
-| **`stage0-posix` (`hex1-1.6.0`)** | `/nix/store/pvk596baqdg5hnmvnjsb1fbca6bz5j4v-hex1-1.6.0` | `/nix/store/3m87j2yh62phlzc3f5nhj4l0m75n55x1-hex1-1.6.0` |
-| **`stage0-posix` (`M2-1.6.0`)** | `/nix/store/3vmryl2mpq9rib67bi6clfvb44nym9jr-M2-1.6.0` | `/nix/store/f2xdw0rhj6k5a3dsirczd0gnlf53f50x-M2-1.6.0` |
-| **`stage0-posix` (`mescc-tools`)** | `/nix/store/k7847sdmcmfqvgpc7ycd5a4wpx49xan0-mescc-tools-1.6.0` | `/nix/store/97n0b1z6g61n330w9qn5r6b1mc4yawzl-mescc-tools-1.6.0` |
-| **`stage0-posix` (`kaem-1.6.0`)** | `/nix/store/9a0qmi15cidrn9kca5j820dw0qan13c8-kaem-1.6.0` | `/nix/store/5ac8fyvhhjj13m4r54kc53b6bbhy7nfw-kaem-1.6.0` |
-| **Stage 0 (`bootstrap-tools`)** | `/nix/store/razasrvdg7ckplfmvdxv4ia3wbayr94s-bootstrap-tools` | `/nix/store/30n2a6x7vsvxj1mzvrvhg8m89f41ci37-bootstrap-tools` |
-| **Stage 0 (`stdenv-linux`)** | `/nix/store/ajrdf015k5ipn89gyh06isniabysrkcw-bootstrap-stage0-stdenv-linux` | `/nix/store/s5j2ficvrlkjb6dhw9ay9zgglh573w98-bootstrap-stage0-stdenv-linux` |
-| **Stage 1 (`stdenv-linux`)** | `/nix/store/wkqjkkwnwhs270sav1mrdz089cmydmj8-bootstrap-stage1-stdenv-linux` | `/nix/store/dk3i95c49wjpsa5xc62cby077qk83y3a-bootstrap-stage1-stdenv-linux` |
-| **Stage xgcc (`xgcc-14.3.0`)** | `/nix/store/nvv5arlnf72xkvpnmnw78ywgdnvx92q3-xgcc-14.3.0` | `/nix/store/g5inkmc4j8pdclpyi2z37vszcr252wib-xgcc-14.3.0` |
-| **Stage xgcc (`stdenv-linux`)** | `/nix/store/azdg07c0qmzmj6cpnbpgmrh9gk1jl91d-bootstrap-stage-xgcc-stdenv-linux` | `/nix/store/75x0pfcacqpsf6h8ppd9fz983r08n69n-bootstrap-stage-xgcc-stdenv-linux` |
-| **Stage 2 (`linux-headers-6.16.7`)** | `/nix/store/9a975kwlj5hyfq8y6hsapfaj5pj7g090-linux-headers-6.16.7` | `/nix/store/b7xga9z9x1rbkj6agr51pgg9v4yf4d5w-linux-headers-6.16.7` |
-| **Stage 2 (`glibc-2.40-224`)** | `/nix/store/7nbi22pcc92y2fqbkyp7h3srvvklmckb-glibc-2.40-224` | `/nix/store/94f38yglcijsz5a8kv7hr3bz2w1is1r0-glibc-2.40-224` |
-| **Stage 3 (`stdenv-linux`)** | `/nix/store/j7sbhs7c8wi0rxfh2f8wyngjdj5lb3z5-bootstrap-stage3-stdenv-linux` | `/nix/store/rpnwisgkssmkndx9yamgvhgmh376ipb7-bootstrap-stage3-stdenv-linux` |
-| **Stage 4 (`gcc-14.3.0`)** | `/nix/store/ipr6y28viyqkhkg58rdvy27m01q5j5nh-gcc-14.3.0` | `/nix/store/ixh56dfh4lq5r87cfl8v3dv7q230hw0h-gcc-14.3.0` |
-| **Stage 4 (`coreutils-9.8`)** | `/nix/store/hqkszxk2c0cxvd04xa4gsaqs182dw8l2-coreutils-9.8` | `/nix/store/nkydbxdsfg1jjyli6mzz5ahfj3m6mj0h-coreutils-9.8` |
-| **Stage 4 (`bash-5.3p3`)** | `/nix/store/3hgg7pr65imdrifqqh3flg3arvkc2r22-bash-5.3p3` | `/nix/store/3894m0zrq35da26lpk0kk2lasdmc98vw-bash-5.3p3` |
-| **Final `stdenv-linux`** | `/nix/store/0i25iw4373868kjqhafvmd6pn1wwzkh3-stdenv-linux` | `/nix/store/5cbirwzcqq4rdwib11lh1k5rbz3xma8l-stdenv-linux` |
-| **Final `hello-2.12.2`** | `/nix/store/18bbdvag5v2f3d4y37pdbkzvh7s71cw4-hello-2.12.2` | `/nix/store/sn0pwh1agh2hnlbgm61ra3qr6yiz6ja8-hello-2.12.2` |
-
-#### Cross-Stage Content-Addressed Deduplication (20 Output Groups Across Stages 0–4)
-Querying `PathRewrites` in `casper-store/nix/var/nix/db/db.sqlite` showed **20 output groups** (39 duplicate outputs eliminated) where derivations built across different bootstrap stages (with distinct `.drv` hashes and toolchains) produced identical blinded content and automatically converged to the exact same content-addressed store path:
-
-| Converged Content-Addressed `outputPath` | Stage Count | Distinct Input Hash Prefixes (`inputPath`) |
-| :--- | :---: | :--- |
-| `/nix/store/h2zm8gx40nhw8sj8757xh5pcpglw8gnb-gnu-config-2024-01-01` | **6** | `nkp2jjfx`, `wqzpxm4j`, `y6alivz8`, `xdj1hdnn`, `nynfiaxg`, `ay97s1f2` |
-| `/nix/store/1sid5bc540bia6li9ggk7sc7di5nm89h-update-autotools-gnu-config-scripts-hook` | **6** | `ivs0xima`, `w3f3v1va`, `44bzap4q`, `zmbyl8wb`, `zxixwkhw`, `4s62rh5i` |
-| `/nix/store/isksmxafyj4ldqkn6zwbrz4cq1rp7qxz-bash-5.3p3-info` | **5** | `pqqcpb5q`, `4pz2asx9`, `k52n6fp4`, `ycy1vg2n`, `f4q2risa` |
-| `/nix/store/mflf4dq4x1wmsglpra9gsnq49z8an7mf-bash-5.3p3-man` | **5** | `vsrzjz05`, `83s5r9zn`, `irvzpqbc`, `3br10pn2`, `y3hrz22j` |
-| `/nix/store/xdkj3ydj7q3px091xay4wx9hgwl8hidx-bash-5.3p3-doc` | **5** | `sidp11qn`, `5i8iqc88`, `sia47i7m`, `d5h5g51l`, `m569srhy` |
-| `/nix/store/ii3700nq7nnfhp8zfssjczarw60izsdv-nuke-references` | **4** | `rxxjh38q`, `wwiqgin8`, `jrabk1pr`, `2kh0hlwq` |
-| `/nix/store/0xz45i1lvf06pjxydpddid2nglir332r-expand-response-params` | **2** | `gk36k5fd`, `bzkq151p` *(compiled C binary deduplicated across stages)* |
-| `/nix/store/kcrsbmlryh3rjgmx1ns9lrshsj3i6zxs-bash-5.3p3-debug` | **2** | `2hg82qsg`, `i7p4sb8d` |
-| `/nix/store/78x0j5kl28kgf46699s3pisjafbax3j0-binutils-2.44-man` | **2** | `2b43ga3y`, `5951bdp9` |
-| `/nix/store/k8yn35adnbq8vivkljg6bjb10lh5bwfx-binutils-2.44-info` | **2** | `b4b5lfds`, `ynws37nl` |
-| `/nix/store/6i8rmmr9b3w6nfm1mbad4a8rj05ykjb8-binutils-wrapper-2.44-man` | **2** | `641ksb94`, `iwh74pj4` |
-| `/nix/store/5ddi5vhhma11h30v7mqa5b9ipq63fqcj-binutils-wrapper-2.44-info` | **2** | `0s7vn1v9`, `fmf1v6h8` |
-| `/nix/store/8w7bd80468acw2ki886x4mcz9jw52b13-python-setup-hook.sh` | **2** | `4441jg4a`, `1ay695zg` |
-| `/nix/store/p8mqjin5gf9acxzdgk722ylh6d50vxis-gmp-6.3.0-info` | **2** | `3g3f04ja`, `a945qkvw` *(distinct from `2ypdc6zv6xxgg65aykz0177m9wgn4rga-gmp-with-cxx-6.3.0-info` via name-mixed `casper:out` derivation)* |
-| `/nix/store/r2dg2j6svx26z7z9kkp6b5laskkxmr21-mpfr-4.2.2-doc` | **2** | `3m1319j9`, `fiqrdsdy` |
-| `/nix/store/wc4dm2kbkipfx437qa39aq0kc39q1lxd-mpfr-4.2.2-info` | **2** | `s6w6ji55`, `5fmqqppa` |
-| `/nix/store/3zpq1q2dnsklbf41wlvfkx8rwjf2s8d4-xz-5.8.3-doc` | **2** | `x4qgpmhz`, `h4ch4ldb` |
-| `/nix/store/2kfnv0hyikydq1mmfpqh7ld64wq96fdl-xz-5.8.3-man` | **2** | `yzci0g7r`, `34qc1s1k` |
-| `/nix/store/29a0hwkx4wfj3xbiz5233gqg9g1g6qwh-libxcrypt-4.5.2-man` | **2** | `cc7r666h`, `yhficm51` |
-| `/nix/store/fzm5c1csn6slg3zsb850lznsy96mg52k-gettext-0.25.1-info` | **2** | `nky8g413`, `wripq293` |
-
-#### Key Technical Findings from the Real Bootstrap
-1. **Zero Injected Files & Pure `NAR` $\to$ `NAR` In-Process Stream Relocation**:
-   - In `minimal-bootstrap` (`stage0-posix`), early derivations (`hex1`, `hex2`, `M0`, `M2`, `blood-elf-0`) execute in a bare sandbox with **no `/bin/sh`, `find`, or `sed`**, and many outputs are single regular executable files (`S_ISREG`) rather than directories (`S_ISDIR`).
-   - Because [`relocateNAR`](nix/src/libstore/build/derivation-builder-impl.cc#L108-L273) operates directly on the NAR stream in C++ (including in-memory `.gz` decompression, rewriting, and deterministic `gzip -n` recompression) and only spawns `$out/nix-support/relocate.sh` when a package explicitly provides one, all 313 bootstrap outputs relocated in-process without injecting any extra files into `$out`.
-2. **Selective Binary Cache Substitution (`type(*drv).isCA()`)**:
-   - Standard binary caches (`cache.nixos.org`) index input-addressed derivations by `<inputHash>-<name>`, whereas `CAFixed` derivations (source tarballs, `bootstrap-tools.tar.xz`, `stage0-posix` seeds) are indexed by fixed content hash.
-   - Restricting binary cache substitution to `type(*drv).isCA()` in [`DerivationGoal::haveDerivation`](nix/src/libstore/build/derivation-goal.cc#L93) and [`Store::queryMissing`](nix/src/libstore/misc.cc#L268) allows CASPER to fetch fixed-output source tarballs from `cache.nixos.org` while building and relocating all input-addressed derivations locally.
-3. **Resolving `allowedReferences` & `disallowedRequisites` After Relocation**:
-   - Foundational packages in `nixpkgs` (`glibc-2.40-224`, `gcc-14.3.0`, `bootstrap-stage*-stdenv-linux`) specify strict `allowedReferences`, `allowedRequisites`, `disallowedReferences`, and `disallowedRequisites` lists containing evaluation-time `<inputHash>-<name>` store paths.
-   - Updating [`checkOutputs`](nix/src/libstore/build/derivation-check.cc#L23-L52) to resolve those paths through `store.resolveInputPath` (and the current derivation's `outputs` map) allowed every bootstrap stage's reference checks to pass without modifying `nixpkgs`.
-4. **Empirical `.gz` Recompression in the Bootstrap**:
-   - Multi-output packages (`outputs = [ "out" "man" ... ]`) whose `.gz` manpages embed sibling `$out` references were automatically detected during the pre-sort sibling scan, topologically ordered after `$out`, and rewritten in-stream by [`relocateNAR`](nix/src/libstore/build/derivation-builder-impl.cc#L172-L205):
-     1. `rzkzgcpi35061aphd7nvw9q4567ws09d-file-5.45-man`: `share/man/man1/file.1.gz`, `share/man/man3/libmagic.3.gz`, and `share/man/man4/magic.4.gz` (rewrote `/nix/store/018l43lbsqbrsasrfdcxxb5s4s161fkr-file-5.45/share/misc/magic*` $\to$ `/nix/store/40xf2hs1hr0934ad6a5w1kb6krc16g7a-file-5.45/share/misc/magic*`).
-     2. `vbrchwv2wc4s32cdnf6ns12b751b5v3f-gettext-0.25.1-man` (Stage 3): `share/man/man1/gettext.1.gz` and `share/man/man1/ngettext.1.gz` (rewrote `/nix/store/qawh4dvis37x3nvvsd1n53v13gy9yq9g-gettext-0.25.1/share/locale` $\to$ `/nix/store/mj7f7qmykivmz7cmwq62gn0zd5w173is-gettext-0.25.1/share/locale`).
-     3. `8gjj4hnbj7fr4bfyd2yp5bfvbx5lh7d7-gettext-0.25.1-man` (Stage 4): `share/man/man1/gettext.1.gz` and `share/man/man1/ngettext.1.gz` (rewrote `/nix/store/yfnzmmv8r4wzgg2f0fci4xl874lm7w5x-gettext-0.25.1/share/locale` $\to$ `/nix/store/6jz09pa69k6nfijv6ij5laf6k4m8qh2z-gettext-0.25.1/share/locale`).
-
-
+- **[Detailed Architecture (`docs/DETAILS.md`)](docs/DETAILS.md)**: End-to-end operational pipeline, Mermaid flowchart, `NAR` $\to$ `NAR` stream protocol, and multi-output/downstream dependency rewriting.
+- **[Nixpkgs Bootstrapping & Packaging Guide (`docs/BOOTSTRAPPING_AND_PACKAGING.md`)](docs/BOOTSTRAPPING_AND_PACKAGING.md)**: Packaging trade-offs for opaque formats, the dual-location rebuild trick, [`casper-overlay.nix`](casper-overlay.nix) internals, and full `stage0-posix` / `stdenv` bootstrap tables.
+- **[Nix C++ Implementation Overview (`docs/NIX_IMPLEMENTATION.md`)](docs/NIX_IMPLEMENTATION.md)**: Summary of modified C++ files in the [`nix/`](nix) submodule.
+- **[Security Considerations & Threat Model (`docs/SECURITY.md`)](docs/SECURITY.md)**: Sandbox threat model, prototype vulnerabilities, dynamic `<relocator-hash>` blinding construction, and Pass 3 fixed-point verification.
+- **[Alternatives Considered (`docs/ALTERNATIVES_CONSIDERED.md`)](docs/ALTERNATIVES_CONSIDERED.md)**: Discarded design alternatives (in-place directory mutation, separate `hash.sh`, `/nix/build`, and `.`-prefixed store paths).
+- **[Empirical Self-Reference Analysis (`docs/EMPIRICAL_ANALYSIS.md`)](docs/EMPIRICAL_ANALYSIS.md)**: Measurements of self-referencing store paths across Nixpkgs by output category and size.

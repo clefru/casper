@@ -1,6 +1,6 @@
 # CASPER Implementation Overview (Modified C++ Files in `nix/`)
 
-This document summarizes the C++ modifications made inside the [`nix/`](../nix) submodule to implement **CASPER (Content-Addressable Store via Partial-blinding and Embedded Relocation)** (see [README.md](../README.md), [DETAILS.md](DETAILS.md), [SECURITY.md](SECURITY.md), and [ALTERNATIVES_CONSIDERED.md](ALTERNATIVES_CONSIDERED.md)).
+This document summarizes the C++ modifications made inside the [`nix/`](../nix) submodule to implement **CASPER (Content-Addressable Store via Partial-blinding and Embedded Relocation)** (see [README.md](../README.md), [DETAILS.md](DETAILS.md), [BOOTSTRAPPING_AND_PACKAGING.md](BOOTSTRAPPING_AND_PACKAGING.md), [SECURITY.md](SECURITY.md), and [ALTERNATIVES_CONSIDERED.md](ALTERNATIVES_CONSIDERED.md)).
 
 ---
 
