@@ -6,7 +6,7 @@
 In traditional Nix, derivation outputs are **input-addressed**: a derivation with masked input hash `abcdef...` builds its output directly into `/nix/store/abcdef...-foo-1.2.3`, and that path is registered in the store regardless of the actual bytes produced. Two derivations with different inputs that compile to the exact same output cannot share a store path or short-circuit downstream rebuilds.
 
 Nix has long sought to move to **output-addressed (content-addressed) derivations**, where every built object in `/nix/store` is named by the cryptographic hash of its output contents (`/nix/store/<output-hash>-<name>`). However, **self-referencing outputs** are the natural blocker:
-- Over **54.9%** of packages (and **72.2%** by store size) embed their own `$out` store path inside their build outputs—in ELF `DT_RUNPATH`s, shebangs, wrapper scripts, `pkg-config` `.pc` files, Python `.pyc` bytecode, and even inside compressed files such as `.gz` manpages.
+- Over **54.9%** of packages (and **72.2%** by store size; see [empirical-analysis.md](empirical-analysis.md)) embed their own `$out` store path inside their build outputs—in ELF `DT_RUNPATH`s, shebangs, wrapper scripts, `pkg-config` `.pc` files, Python `.pyc` bytecode, and even inside compressed files such as `.gz` manpages.
 - During the build, `$out` must already be known so compilers and build scripts can embed `/nix/store/<hash>-<name>` into binaries and data files.
 - Yet if `<hash>` is the cryptographic hash of the output, then the output's contents must contain `<hash>` before `<hash>` can be computed—an **unsolvable cryptographic hash loop**:
   $$H = \text{Hash}\big(\text{output containing } \texttt{/nix/store/} \parallel H \parallel \texttt{-foo}\big)$$
@@ -36,40 +36,9 @@ One way to sidestep the self-reference loop without rewriting package contents i
 
 ---
 
-## 2. Empirical Analysis of Self-Referencing Packages (Local `/nix/store`)
+## 2. Detailed Architecture
 
-Querying the local Nix store database (`/nix/var/nix/db/db.sqlite`, 208,009 valid paths) shows why handling self-references (including `.gz` manpages, `.pyc` bytecode, `pkg-config`, and ELF `DT_RUNPATH`) is critical:
-
-### 2.1 Overall Store Breakdown
-
-| Category | Total Paths | Self-Referencing | Non-Self-Referencing | % Self-Ref | Total Size (GB) | Self-Ref Size (GB) |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Input-addressed package outputs** (`ca IS NULL`) | **27,255** | **14,972** | **12,283** | **54.9%** | **258.60 GB** | **186.62 GB** |
-| Fixed-output / Sources (`ca = fixed:*`) | 3,980 | 0 | 3,980 | 0.0% | 66.33 GB | 0.00 GB |
-| Text / Eval files (`ca = text:*`) | 35 | 0 | 35 | 0.0% | 0.00 GB | 0.00 GB |
-| Derivations (`*.drv`) | 176,739 | 0 | 176,739 | 0.0% | 0.64 GB | 0.00 GB |
-
-### 2.2 Breakdown of Input-Addressed Outputs by Output / Package Type
-
-| Output / Package Category | Total | Self-Referencing | Non-Self-Referencing | % Self-Ref | Why Self-References Occur |
-| :--- | ---: | ---: | ---: | ---: | :--- |
-| **Perl packages (`perl5*`)** | 616 | 616 | 0 | **100.0%** | `.packlist` and shebangs embed `$out` |
-| **Dev outputs (`*-dev`)** | 637 | 593 | 44 | **93.1%** | `pkg-config` (`prefix=$out`) and CMake configs |
-| **Python packages (`python3*`)** | 1,502 | 1,401 | 101 | **93.3%** | `.pyc` bytecode headers embed `$out/.../foo.py` |
-| **Library outputs (`*-lib`)** | 1,093 | 855 | 238 | **78.2%** | ELF `DT_RUNPATH` includes `$out/lib` |
-| **Primary outputs (`out`)** | 23,602 | 13,378 | 10,224 | **56.7%** | Mix of ELF RPATHs, wrapper scripts, `.gz` manpages, data |
-| **Binary outputs (`*-bin`)** | 491 | 140 | 351 | **28.5%** | Most link against `*-lib` rather than `*-bin` |
-| **TeX Live packages (`texlive-*`)** | 142 | 30 | 112 | **21.1%** | Mostly pure TeX macros/fonts |
-| **Docs / Man / Info (`*-doc`, `*-man`, `*-info`)** | 1,388 | 6 | 1,382 | **0.4%** | Occasional `.gz` manpage / HTML doc embedding `$out` |
-| **Data outputs (`*-data`)** | 44 | 0 | 44 | **0.0%** | Pure data files |
-
-With `relocate.sh` normalizing self-references before hashing and rewriting them to the output hash afterward, **100% of packages** (both the 45.1% non-self-referencing and the 54.9% self-referencing packages, including those with `.gz` files) become truly content-addressed and deduplicatable.
-
----
-
-## 3. Detailed Architecture
-
-### 3.1 End-to-End Operational Pipeline
+### 2.1 End-to-End Operational Pipeline
 
 1. **Evaluation & Build in Input-Hash Path (`<input-hash>-<name>`)**:
    - At evaluation time (`builtins.derivation`), a derivation `foo-1.2.3` still computes its standard 32-character input-addressed path `/nix/store/abcdef...-foo-1.2.3`.
@@ -101,7 +70,7 @@ flowchart TD
     E --> F["6. Downstream build (bar):\nRewrite abcdef -> fahxx11 in bar's builder args, env & sandbox inputs"]
 ```
 
-### 3.2 `relocate.sh` as a `NAR` $\to$ `NAR` Stream Transformer (`stdin` $\to$ `stdout`)
+### 2.2 `relocate.sh` as a `NAR` $\to$ `NAR` Stream Transformer (`stdin` $\to$ `stdout`)
 
 #### Core Contract
 Instead of mutating a directory tree in place on the host filesystem, `relocate` (`$out/nix-support/relocate.sh`) operates as a pure **`NAR` $\to$ `NAR` stream filter**:
@@ -136,7 +105,7 @@ Instead of mutating a directory tree in place on the host filesystem, `relocate`
 
 ---
 
-### 3.3 Downstream Dependency Rewriting
+### 2.3 Downstream Dependency Rewriting
 
 Because we do not keep symlinks at `/nix/store/<inputHash>-<name>`, downstream derivations that were evaluated with `<inputHash>-<name>` are rewritten to `<outHash>-<name>` before they are built:
 
@@ -156,9 +125,9 @@ Because we do not keep symlinks at `/nix/store/<inputHash>-<name>`, downstream d
 
 ---
 
-## 4. Prototype Implementation Overview (Modified C++ Files in `nix/`)
+## 3. Prototype Implementation Overview (Modified C++ Files in `nix/`)
 
-*(Note: The initial C++ bootstrap prototype in `nix/` implemented the in-place directory relocation alternative described in Section 5.1 below to validate the full Nixpkgs bootstrap).*
+*(Note: The initial C++ bootstrap prototype in `nix/` implemented the in-place directory relocation alternative described in Section 4.1 below to validate the full Nixpkgs bootstrap).*
 
 1. **[`src/libstore/schema.sql`](nix/src/libstore/schema.sql), [`src/libstore/local-store.cc`](nix/src/libstore/local-store.cc), [`src/libstore/include/nix/store/local-store.hh`](nix/src/libstore/include/nix/store/local-store.hh), [`src/libstore/outputs-query.cc`](nix/src/libstore/outputs-query.cc), [`src/libstore/store-dir-config.cc`](nix/src/libstore/store-dir-config.cc)**:
    - Added `PathRewrites (inputPath text primary key not null, outputPath text not null)` table and prepared statements (`AddPathRewrite`, `QueryPathRewrite`, `QueryAllPathRewrites`).
@@ -175,17 +144,17 @@ Because we do not keep symlinks at `/nix/store/<inputHash>-<name>`, downstream d
 
 ---
 
-## 5. Alternatives Considered (and Why They Were Discarded)
+## 4. Alternatives Considered (and Why They Were Discarded)
 
-### 5.1 In-Place Directory Relocation (`relocate.sh <target-dir> <old-self> <new-self>`) (Discarded / Used in Initial Prototype)
+### 4.1 In-Place Directory Relocation (`relocate.sh <target-dir> <old-self> <new-self>`) (Discarded / Used in Initial Prototype)
 
-Before converging on the `NAR` $\to$ `NAR` stream transformer design (Section 3.1), the initial CASPER design and bootstrap prototype mutated `$out` in place on the filesystem via `relocate.sh <target-path> <old-self> <new-self>`:
+Before converging on the `NAR` $\to$ `NAR` stream transformer design (Section 2.2), the initial CASPER design and bootstrap prototype mutated `$out` in place on the filesystem via `relocate.sh <target-path> <old-self> <new-self>`:
 ```sh
 /bin/sh "$out/nix-support/relocate.sh" <target-path> <old-self> <new-self>
 ```
 
-- **Why Discarded in Favor of `NAR` $\to$ `NAR` (Section 3.1)**:
-  1. **Host-`root` vs. Sandbox-User Filesystem Races**: Mutating `$out` in place on the host filesystem requires `chown`/`chmod` dances between the host `root` daemon and the sandbox `buildUser`, opening TOCTOU symlink and hardlink races (Section 6.4 #4) and leaking filesystem metadata (`mtime`/`inode`) between passes.
+- **Why Discarded in Favor of `NAR` $\to$ `NAR` (Section 2.2)**:
+  1. **Host-`root` vs. Sandbox-User Filesystem Races**: Mutating `$out` in place on the host filesystem requires `chown`/`chmod` dances between the host `root` daemon and the sandbox `buildUser`, opening TOCTOU symlink and hardlink races (Section 5.4 #4) and leaking filesystem metadata (`mtime`/`inode`) between passes.
   2. **Redundant Disk I/O**: In-place mutation requires writing the blinded tree to disk, reading it back to hash it, and mutating it on disk a second time, whereas `NAR` $\to$ `NAR` pipes the blinded NAR stream directly into `HashSink(SHA256)` with zero disk writes.
 
 #### Prototype Default `$out/nix-support/relocate.sh` Script
@@ -250,7 +219,7 @@ Inside `UnixDerivationBuilderImpl` / `ChrootLinuxDerivationBuilder` and [`Deriva
 
 ---
 
-### 5.2 Separate `$out/nix-support/hash.sh` Script (Discarded)
+### 4.2 Separate `$out/nix-support/hash.sh` Script (Discarded)
 
 - **Idea**: Alongside `$out/nix-support/relocate.sh`, include a second script `$out/nix-support/hash.sh` responsible for computing the output's content hash (and allowing post-build verification on installed paths):
   ```sh
@@ -286,7 +255,7 @@ Inside `UnixDerivationBuilderImpl` / `ChrootLinuxDerivationBuilder` and [`Deriva
 
 ---
 
-### 5.3 Building in `/nix/build/<inputHash>-<name>` and Relocating to `/nix/store/<outHash>-<name>` (Discarded)
+### 4.3 Building in `/nix/build/<inputHash>-<name>` and Relocating to `/nix/store/<outHash>-<name>` (Discarded)
 - **Idea**: Build derivations in `/nix/build/<inputHash>-<name>` instead of `/nix/store/<inputHash>-<name>`, then relocate to `/nix/store/<outHash>-<name>`. Since `"build"` and `"store"` both have 5 letters (`strlen("/nix/build/") == strlen("/nix/store/") == 11`), binary `RPATH`s and string tables keep the exact same byte length, while in-flight build outputs are cleanly separated from `/nix/store`.
 - **Why Discarded**: In Nixpkgs, `binutils-wrapper` (`ld-wrapper`) enforces path purity via `badPath()` in `nix-support/utils.bash`:
   ```bash
@@ -306,7 +275,7 @@ Inside `UnixDerivationBuilderImpl` / `ChrootLinuxDerivationBuilder` and [`Deriva
   - As a result, unmodified Nixpkgs `ld-wrapper` treats `/nix/build/<inputHash>-<name>/lib` as an impure host path (like `/usr/lib`), stripping `-rpath $out/lib` from ELF binaries and aborting the link (`impure path '/nix/build/...' used in link`) whenever a full path `$out/lib/libfoo.so` is passed on the linker command line.
   - Building in `/nix/store/<inputHash>-<name>` inside the sandbox remains 100% compatible with unmodified Nixpkgs `stdenv` and `ld-wrapper`.
 
-### 5.4 Hidden `.`-Prefixed Build Directory (`/nix/store/.<inputHash>-<name>`) + Store Symlinks (Discarded)
+### 4.4 Hidden `.`-Prefixed Build Directory (`/nix/store/.<inputHash>-<name>`) + Store Symlinks (Discarded)
 - **Idea**: Build in `/nix/store/.<inputHash>-<name>`, rename to `/nix/store/<outHash>-<name>` after the build, and place a symlink `.abcdef-foo -> fahxx11-foo` so self-references and downstream dependencies resolve through the symlink without rewriting.
 - **Why Discarded**:
   1. Adding a leading `.` makes the build path 1 byte longer than the final path (`33` vs `32` chars before `-<name>`), preventing safe in-place binary rewriting of ELF string tables.
@@ -314,14 +283,14 @@ Inside `UnixDerivationBuilderImpl` / `ChrootLinuxDerivationBuilder` and [`Deriva
 
 ---
 
-## 6. Reflections, Security Analysis & Verification Tricks
+## 5. Reflections, Security Analysis & Verification Tricks
 
-### 6.1 The Packaging Drawback: Maintaining `relocate.sh` for Opaque Formats
+### 5.1 The Packaging Drawback: Maintaining `relocate.sh` for Opaque Formats
 - In CASPER, package maintainers have the added responsibility of thinking about `relocate.sh` during packaging.
 - Plaintext and standard ELF binary self-references are easy to spot with `grep` and are handled automatically by `sed` in the default `relocate.sh`.
 - However, self-references buried inside compressed or encoded formats—such as `.gz` files (handled by default), `.xz`/`.zst` archives, `.zip`/`.jar`/`.whl` archives, SQLite databases, or custom binary caches—are invisible to a naive `grep`. Spotting and rewriting these references normally requires package-specific domain knowledge so the packager can extend `relocate.sh` to unpack, rewrite, and repack those files.
 
-### 6.2 Trick for Deterministic Packages: Dual-Location Rebuild to Detect Incomplete `relocate.sh`
+### 5.2 Trick for Deterministic Packages: Dual-Location Rebuild to Detect Incomplete `relocate.sh`
 - For **fully deterministic packages** (packages that always produce the exact same output byte stream given identical inputs and build environment), we can automatically detect hidden, unrelocated self-references *without* needing prior knowledge of the package's file formats:
   1. **Build 1**: Build the package in its normal scratch location `/nix/store/<input-hash>-foo`, run `relocate.sh` to blind `/nix/store/<input-hash>-foo` $\to$ `/nix/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-foo`, and compute the blinded output hash $H_1$.
   2. **Build 2 (`-recheck`)**: Rebuild the exact same derivation into a different output location—for example, `/nix/store/<input-hash>-foo-recheck` (or an alternate scratch hash).
@@ -331,9 +300,9 @@ Inside `UnixDerivationBuilderImpl` / `ChrootLinuxDerivationBuilder` and [`Deriva
      - If the build embedded `$out` inside an unhandled format (e.g., an `.xz` archive or binary cache that `relocate.sh` did not unpack), the `-recheck` suffix remains inside that file after `relocate.sh` runs, causing $H_1 \neq H_2$.
      - Comparing the two blinded trees immediately alerts the packager to the incomplete `relocate.sh` and pinpoints the exact file containing the hidden self-reference.
 
-### 6.3 Security Threat Model: Sandbox Bait-and-Switch in `relocate.sh` and Closure-Bound External Relocators
+### 5.3 Security Threat Model: Sandbox Bait-and-Switch in `relocate.sh` and Closure-Bound External Relocators
 
-Even after discarding `hash.sh` (Section 5.2) so that Nix always computes the SHA-256 NAR hash directly in C++ over the blinded output at Step 2b, what if a malicious derivation tries to pull a bait-and-switch between **Pass 1** (blinding before hashing) and **Pass 2** (relocating after hashing)?
+Even after discarding `hash.sh` (Section 4.2) so that Nix always computes the SHA-256 NAR hash directly in C++ over the blinded output at Step 2b, what if a malicious derivation tries to pull a bait-and-switch between **Pass 1** (blinding before hashing) and **Pass 2** (relocating after hashing)?
 - **Why the bait-and-switch cannot remain inside `$out` at Step 2b (and the Self-Erasing `relocate.sh` Bypass)**:
   - Because `$out/nix-support/relocate.sh` is inside `$out`, it is included in the C++ NAR SHA-256 hash at Step 2b. If `$out/nix-support/relocate.sh` still differs by even a single byte at Step 2b (or if a second copy of `libc.so.6` is still stashed inside `$out`), the NAR hash at Step 2b changes and **will not match** legitimate `glibc`'s hash. At Step 2b, the entire `$out` directory must be byte-for-byte identical to legitimate blinded `glibc`.
   - **However**, in the directory-mutating prototype ([`DerivationBuilderImpl::registerOutputs`](nix/src/libstore/build/derivation-builder-impl.cc#L621-L670)), `hasCustomRelocate` is latched *before* Pass 1 (line 622) and `needRelocateScript` is cached at line 635. A malicious custom `$out/nix-support/relocate.sh` can therefore execute during **Pass 1**, spawn a background process or stage a trigger in `/build`, and **overwrite `$out/nix-support/relocate.sh` with `defaultRelocateScript`** before exiting Pass 1—so `$out` is 100% identical to legitimate blinded `glibc` during Step 2b, yet `needRelocateScript` remains `true` for Pass 2.
@@ -349,7 +318,7 @@ Even after discarding `hash.sh` (Section 5.2) so that Nix always computes the SH
     $$H_{\text{out}} = \text{compressHash}\big(\text{SHA256}(\text{"casper:ext-reloc:"} \parallel H_{\text{closure}} \parallel \text{":"} \parallel H_{\text{blinded-nar}}), 20\big)$$
   - Because an untrusted relocator closure $C_{\text{evil}}$ differs from legitimate `glibc`'s relocator ($C_{\text{good}}$), $H_{\text{closure}}(C_{\text{evil}}) \neq H_{\text{closure}}(C_{\text{good}})$, making it computationally infeasible ($2^{160}$ brute-force work) for a hostile relocator to hit legitimate `glibc`'s store hash.
 
-### 6.4 Further Security & Correctness Vulnerabilities in the Prototype
+### 5.4 Further Security & Correctness Vulnerabilities in the Prototype
 
 1. **Pre-Blinded Placeholder Collision & Unblinding Mutation (`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-<name>`)**:
    - In Step 1, CASPER blinds `<inputHash>-<name>` to `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-<name>` (32 `'x'` characters), hashes the directory in Step 2, and replaces **every** occurrence of `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-<name>` with `<outHash>-<name>` in Step 3.
@@ -360,7 +329,7 @@ Even after discarding `hash.sh` (Section 5.2) so that Nix always computes the SH
 
 2. **Identical 32-Char `hashPart` Across Different Package Names (`SIGABRT` DoS in `PathRefScanSink`)**:
    - In [`StoreDirConfig::makeContentAddressedOutputPath`](nix/src/libstore/store-dir-config.cc), `<outHash>` is currently computed purely from `compressHash(narHash, 20)` **without mixing in `name`**.
-   - As observed in the bootstrap (Section 7.4), `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-6.3.0-info` and `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-with-cxx-6.3.0-info` have different names (`gmp-6.3.0-info` vs. `gmp-with-cxx-6.3.0-info`) but the **exact same 32-character `hashPart`** (`j1zgcfidm58ay0zxcc724ciwxv6mwn91`). The same occurs whenever two packages produce identical or empty `-doc` directories.
+   - As observed in the bootstrap (Section 6.4), `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-6.3.0-info` and `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-with-cxx-6.3.0-info` have different names (`gmp-6.3.0-info` vs. `gmp-with-cxx-6.3.0-info`) but the **exact same 32-character `hashPart`** (`j1zgcfidm58ay0zxcc724ciwxv6mwn91`). The same occurs whenever two packages produce identical or empty `-doc` directories.
    - However, Nix's reference scanner in [`PathRefScanSink::fromPaths`](nix/src/libstore/path-references.cc#L20-L33) assumes every `StorePath` has a globally unique 32-character `hashPart`:
      ```cpp
      for (auto & i : refs) {
@@ -413,7 +382,7 @@ Even after discarding `hash.sh` (Section 5.2) so that Nix always computes the SH
      - If a build mutates files in Step 3 (`relocate.sh` pass 2) after colliding on Step 2's `caOutPath`, SQLite's `ValidPaths.hash`, `narSize`, and local binary cache signature are overwritten with the new build's metadata while the old files stay on disk (or vice versa if a poisoned build ran first and a legitimate build runs second).
    - **Mitigation**: When `localStore.isValidPath(newInfo.path)` is true in `registerOutputs`, verify `newInfo.narHash == oldInfo.narHash` (rejecting mismatches with `BuildResult::Failure::OutputRejected`) before discarding `actualPath` or updating `ValidPaths`.
 
-### 6.5 Desired Invariants for `relocate.sh` & Practical Design Trade-offs
+### 5.5 Desired Invariants for `relocate.sh` & Practical Design Trade-offs
 
 Ideally, `relocate.sh` ($R(T, \text{old}, \text{new})$) would behave as a pure, invertible groupoid action on directory trees. In practice, evaluating which invariants to enforce reveals important design trade-offs:
 
@@ -429,9 +398,9 @@ Ideally, `relocate.sh` ($R(T, \text{old}, \text{new})$) would behave as a pure, 
 
 ---
 
-## 7. Nixpkgs Bootstrapping & Lightweight Overlay Strategy
+## 6. Nixpkgs Bootstrapping & Lightweight Overlay Strategy
 
-### 7.1 Why Hardlinks (`/nix/store/.links`) Beat Symlinks for Default `relocate.sh`
+### 6.1 Why Hardlinks (`/nix/store/.links`) Beat Symlinks for Default `relocate.sh`
 - **The Symlink Trap (`allowedReferences = []`)**:
   - At first glance, embedding a default `relocate.sh` via a symlink (`$out/nix-support/relocate.sh -> /nix/store/<hash>-casper-scripts/relocate.sh`) looks like an attractive way to avoid duplicating script files across thousands of store outputs.
   - However, Nix's reference scanner (`scanForReferences`) scans symlink targets. A symlink pointing to `/nix/store/<hash>-casper-scripts` makes `casper-scripts` a runtime store dependency of **every single output in the store**.
@@ -442,7 +411,7 @@ Ideally, `relocate.sh` ($R(T, \text{old}, \text{new})$) would behave as a pure, 
   - When `localStore.optimisePath` runs at the end of `registerOutputs` (or when `auto-optimise-store = true` is enabled), Nix hashes each file and hard-links identical files to `/nix/store/.links/<sha256>`.
   - Result: Every package using the default `relocate.sh` shares a **single inode** on disk with zero storage overhead and zero reference pollution.
 
-### 7.2 Zero-Touch Default Coverage vs. Lightweight Overlay (`casper-overlay.nix`)
+### 6.2 Zero-Touch Default Coverage vs. Lightweight Overlay (`casper-overlay.nix`)
 - **Zero-Touch Default (`stdenv.mkDerivation`, `runCommand`, `buildEnv`, etc.)**:
   - Because `DerivationBuilder` injects the default `relocate.sh` and `hash.sh` automatically in C++ for every directory output, you do **not** even need to modify `stdenv.mkDerivation` for standard packages. Over 95% of `nixpkgs` packages (standard ELF binaries, shared libraries, shell/Python/Perl wrappers, pkg-config `.pc` files, CMake configs, and `.gz` man/info pages) work out of the box without any Nixpkgs diff.
 - **Lightweight Overlay for Special-Case Packages**:
@@ -507,7 +476,7 @@ in {
 > [!TIP]
 > Notice `cat << 'EOF'` uses `#!/bin/sh` rather than `${prev.runtimeShell}` (`#!/nix/store/...-bash/bin/bash`). This ensures the custom script does not introduce an unwanted runtime store dependency on `bash` for data-only or minimal-closure outputs.
 
-### 7.3 Bootstrapping Strategies: Incremental vs. Full `stdenv` Bootstrap
+### 6.3 Bootstrapping Strategies: Incremental vs. Full `stdenv` Bootstrap
 
 #### Mode A: Incremental Bootstrap on Top of an Existing `/nix/store` (Fastest)
 - You do **not** have to rebuild `stdenv` from stage 0 just to start using CASPER with `nixpkgs`:
@@ -530,7 +499,7 @@ When bootstrapping `nixpkgs` from scratch (`stdenvStages` 0 through final `stden
      - **Java / JVM (`.jar` / `.zip`)**: Unpacking/repacking `.jar` files only when `grep` detects a self-reference inside the uncompressed stream.
      - **macOS (`darwin`)**: Mach-O binaries with ad-hoc code signatures invalidate their signature when `sed` modifies the `LC_RPATH` load command, requiring `codesign -f -s -` in `relocate.sh` on Darwin.
 
-### 7.4 Real-World Bootstrap Verification (`casper-store`)
+### 6.4 Real-World Bootstrap Verification (`casper-store`)
 Both Nixpkgs bootstrap chains were executed end-to-end into `casper-store` using `./build/src/nix/nix-build` and [`casper-overlay.nix`](casper-overlay.nix), producing **326 content-addressed derivation outputs** (`PathRewrites` rows in `casper-store/nix/var/nix/db/db.sqlite`):
 
 1. **Source-Only `stage0-posix` Bootstrap (50 Derivations)**:
