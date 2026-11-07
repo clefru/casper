@@ -6,7 +6,7 @@ This document collects the security considerations, threat models, prototype vul
 
 ## 1. Security Threat Model: Sandbox Bait-and-Switch in `relocate.sh` and Closure-Bound External Relocators
 
-Even after discarding `hash.sh` ([README.md Section 4.2](README.md#42-separate-outnix-supporthashsh-script-discarded)) so that Nix always computes the SHA-256 NAR hash directly in C++ over the blinded output at Step 2b, what if a malicious derivation tries to pull a bait-and-switch between **Pass 1** (blinding before hashing) and **Pass 2** (relocating after hashing)?
+Even after discarding `hash.sh` ([ALTERNATIVES_CONSIDERED.md](ALTERNATIVES_CONSIDERED.md)) so that Nix always computes the SHA-256 NAR hash directly in C++ over the blinded output at Step 2b, what if a malicious derivation tries to pull a bait-and-switch between **Pass 1** (blinding before hashing) and **Pass 2** (relocating after hashing)?
 
 - **Why the bait-and-switch cannot remain inside `$out` at Step 2b (and the Self-Erasing `relocate.sh` Bypass)**:
   - Because `$out/nix-support/relocate.sh` is inside `$out`, it is included in the C++ NAR SHA-256 hash at Step 2b. If `$out/nix-support/relocate.sh` still differs by even a single byte at Step 2b (or if a second copy of `libc.so.6` is still stashed inside `$out`), the NAR hash at Step 2b changes and **will not match** legitimate `glibc`'s hash. At Step 2b, the entire `$out` directory must be byte-for-byte identical to legitimate blinded `glibc`.
@@ -27,7 +27,7 @@ Even after discarding `hash.sh` ([README.md Section 4.2](README.md#42-separate-o
 
 ## 2. Hostile / Weak Hasher Threat (`hash.sh` Attack Surface)
 
-In the discarded design where a derivation could bundle a custom `$out/nix-support/hash.sh` ([README.md Section 4.2](README.md#42-separate-outnix-supporthashsh-script-discarded)):
+In the discarded design where a derivation could bundle a custom `$out/nix-support/hash.sh` ([ALTERNATIVES_CONSIDERED.md](ALTERNATIVES_CONSIDERED.md)):
 - If Nix trusted the stdout of `$out/nix-support/hash.sh` as `<output-hash>`, a broken or hostile derivation (`evil-glibc`) could decouple **the digest Nix uses for the store path** from **the actual bytes in `$out`**.
 - Specifically, `evil-glibc` could predict legitimate `glibc-2.40-224`'s hash (`19zs62pdr843wg6gdlrv42pi9xsk7gin`), write `echo "19zs62pdr843wg6gdlrv42pi9xsk7gin"` in `hash.sh`, and install a malicious `libc.so.6` directly into `/nix/store/19zs62pdr843wg6gdlrv42pi9xsk7gin-glibc-2.40-224`.
 - Even if defended by requiring custom `hash.sh` to be a symlink to an external store dependency whose closure hash $H_{\text{closure}}$ is cryptographically combined with $H_{\text{content}}$ ($\text{SHA256}(H_{\text{closure}} \parallel H_{\text{content}})$), discarding `hash.sh` altogether and always computing the SHA-256 NAR digest inside Nix's C++ `HashSink` removes this attack surface completely.
@@ -45,7 +45,7 @@ In the discarded design where a derivation could bundle a custom `$out/nix-suppo
 
 2. **Identical 32-Char `hashPart` Across Different Package Names (`SIGABRT` DoS in `PathRefScanSink`)**:
    - In [`StoreDirConfig::makeContentAddressedOutputPath`](nix/src/libstore/store-dir-config.cc), `<outHash>` is currently computed purely from `compressHash(narHash, 20)` **without mixing in `name`**.
-   - As observed in the bootstrap ([README.md Section 6.4](README.md#64-real-world-bootstrap-verification-casper-store)), `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-6.3.0-info` and `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-with-cxx-6.3.0-info` have different names (`gmp-6.3.0-info` vs. `gmp-with-cxx-6.3.0-info`) but the **exact same 32-character `hashPart`** (`j1zgcfidm58ay0zxcc724ciwxv6mwn91`). The same occurs whenever two packages produce identical or empty `-doc` directories.
+   - As observed in the bootstrap ([README.md Section 5.4](README.md#54-real-world-bootstrap-verification-casper-store)), `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-6.3.0-info` and `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-with-cxx-6.3.0-info` have different names (`gmp-6.3.0-info` vs. `gmp-with-cxx-6.3.0-info`) but the **exact same 32-character `hashPart`** (`j1zgcfidm58ay0zxcc724ciwxv6mwn91`). The same occurs whenever two packages produce identical or empty `-doc` directories.
    - However, Nix's reference scanner in [`PathRefScanSink::fromPaths`](nix/src/libstore/path-references.cc#L20-L33) assumes every `StorePath` has a globally unique 32-character `hashPart`:
      ```cpp
      for (auto & i : refs) {
