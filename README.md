@@ -164,53 +164,38 @@ Because we do not keep symlinks at `/nix/store/<inputHash>-<name>`, downstream d
 
 ---
 
-## 5. Nixpkgs Bootstrapping & Lightweight Overlay Strategy
+## 4. Nixpkgs Bootstrapping & Lightweight Overlay Strategy
 
-### 5.1 Why Hardlinks (`/nix/store/.links`) Beat Symlinks for Default `relocate.sh`
-- **The Symlink Trap (`allowedReferences = []`)**:
-  - At first glance, embedding a default `relocate.sh` via a symlink (`$out/nix-support/relocate.sh -> /nix/store/<hash>-casper-scripts/relocate.sh`) looks like an attractive way to avoid duplicating script files across thousands of store outputs.
-  - However, Nix's reference scanner (`scanForReferences`) scans symlink targets. A symlink pointing to `/nix/store/<hash>-casper-scripts` makes `casper-scripts` a runtime store dependency of **every single output in the store**.
-  - In `nixpkgs`, foundational packages—including `bootstrap-tools`, `glibc`, `tzdata`, `iana-etc`, and raw source/data directories—enforce `allowedReferences = [];` or `allowedReferences = [ "out" ];`. Adding an extra store reference causes Nix to immediately fail those builds.
-- **The Solution: Static `#!/bin/sh` File + Store Hardlink Deduplication**:
-  - Instead of symlinking to another store path, CASPER's C++ `DerivationBuilder` (`registerOutputs` in [`derivation-builder-impl.cc`](nix/src/libstore/build/derivation-builder-impl.cc#L186-L246)) automatically writes a static, byte-for-byte identical `#!/bin/sh` script into `$out/nix-support/relocate.sh` whenever the builder did not provide a custom one.
-  - Because this script uses `#!/bin/sh` (which always exists inside the Nix build sandbox and on host systems) and relies on `$PATH`, it contains **zero `/nix/store/...` references** and never trips `allowedReferences` checks.
-  - When `localStore.optimisePath` runs at the end of `registerOutputs` (or when `auto-optimise-store = true` is enabled), Nix hashes each file and hard-links identical files to `/nix/store/.links/<sha256>`.
-  - Result: Every package using the default `relocate.sh` shares a **single inode** on disk with zero storage overhead and zero reference pollution.
-
-### 5.2 Zero-Touch Default Coverage vs. Lightweight Overlay (`casper-overlay.nix`)
+### 4.1 Zero-Touch Built-In `NAR` $\to$ `NAR` Relocation vs. Lightweight Overlay (`casper-overlay.nix`)
 - **Zero-Touch Default (`stdenv.mkDerivation`, `runCommand`, `buildEnv`, etc.)**:
-  - Because `DerivationBuilder` injects the default `relocate.sh` and `hash.sh` automatically in C++ for every directory output, you do **not** even need to modify `stdenv.mkDerivation` for standard packages. Over 95% of `nixpkgs` packages (standard ELF binaries, shared libraries, shell/Python/Perl wrappers, pkg-config `.pc` files, CMake configs, and `.gz` man/info pages) work out of the box without any Nixpkgs diff.
+  - Because `DerivationBuilder` performs default `NAR` $\to$ `NAR` relocation directly in C++ via [`relocateNAR`](nix/src/libstore/build/derivation-builder-impl.cc#L108-L273) without injecting any extra files into `$out`, standard packages do not require any `stdenv.mkDerivation` changes or extra store references (`allowedReferences = []` works unmodified). Over 95% of `nixpkgs` packages (standard ELF binaries, shared libraries, shell/Python/Perl wrappers, pkg-config `.pc` files, CMake configs, and `.gz` man/info pages) work out of the box without any Nixpkgs diff.
 - **Lightweight Overlay for Special-Case Packages**:
-  - Rather than maintaining a massive `nixpkgs` fork, CASPER overrides can live in a small, self-contained Nixpkgs overlay (`casper-overlay.nix`).
-  - Whenever a package embeds self-references inside a specialized container format or requires non-deterministic output blinding, the overlay wraps it with a `withCasper` helper using `overrideAttrs` (or `overrideDerivation` for non-`mkDerivation` builders):
+  - Rather than maintaining a massive `nixpkgs` fork, CASPER overrides live in a small, self-contained Nixpkgs overlay ([`casper-overlay.nix`](casper-overlay.nix)).
+  - Whenever a package embeds self-references inside a specialized container format or requires custom relocation, the overlay wraps it with the `withCasper` helper using `overrideAttrs` (or `overrideDerivation` for non-`mkDerivation` builders) to emit a custom `NAR` $\to$ `NAR` (`stdin` $\to$ `stdout`) `$out/nix-support/relocate.sh`:
 
 ```nix
 final: prev:
 let
-  # Helper to attach custom CASPER relocate.sh / hash.sh hooks to any derivation
-  withCasper = { relocateExtra ? "", hashExtra ? "" }: pkg:
+  # Helper to attach a custom NAR -> NAR ($out/nix-support/relocate.sh) hook to any derivation
+  withCasper = { relocateExtra ? "", relocateStream ? "" }: pkg:
     pkg.overrideAttrs (old: {
-      postFixup = (old.postFixup or "") + ''
-        mkdir -p $out/nix-support
-      '' + prev.lib.optionalString (relocateExtra != "") ''
-        cat << 'EOF' > $out/nix-support/relocate.sh
+      postFixup = (old.postFixup or "") + prev.lib.optionalString (relocateExtra != "") ''
+        mkdir -p "$out/nix-support"
+        cat << 'EOF' > "$out/nix-support/relocate.sh"
         #!/bin/sh
         set -e
-        TARGET_DIR="$1"
-        OLD_SELF="$2"
-        NEW_SELF="$3"
-        # Default text, binary & .gz relocation:
-        find "$TARGET_DIR" -type f ! -name "*.gz" -exec sed -i "s|$OLD_SELF|$NEW_SELF|g" {} +
+        old="$1"
+        new="$2"
+        workdir=$(mktemp -d)
+        trap 'chmod -R u+w "$workdir" 2>/dev/null || true; rm -rf "$workdir"' EXIT
+        target="$workdir/root"
+        nix-store --restore "$target"
+        chmod -R u+w "$target" 2>/dev/null || true
+        find "$target" -type f ! -name "*.gz" -exec sed -i "s|$old|$new|g" {} +
         ${relocateExtra}
+        nix-store --dump "$target"
         EOF
-        chmod +x $out/nix-support/relocate.sh
-      '' + prev.lib.optionalString (hashExtra != "") ''
-        cat << 'EOF' > $out/nix-support/hash.sh
-        #!/bin/sh
-        set -e
-        ${hashExtra}
-        EOF
-        chmod +x $out/nix-support/hash.sh
+        chmod +x "$out/nix-support/relocate.sh"
       '';
     });
 in {
@@ -220,8 +205,8 @@ in {
       prev.lib.mapAttrs (name: pkg:
         withCasper {
           relocateExtra = ''
-            # Recompute SHA-256 digests in *.dist-info/RECORD after shebang/path relocation
-            find "$TARGET_DIR" -path "*.dist-info/RECORD" -exec sed -i "/nix\/store/d" {} +
+            # Strip SHA-256 digests in *.dist-info/RECORD after shebang/path relocation
+            find "$target" -path "*.dist-info/RECORD" -exec sed -i 's|,sha256=[^,]*,|,,|g' {} +
           '';
         } pkg
       ) pyPrev;
@@ -230,8 +215,8 @@ in {
   # Example 2: Packages with .zst or .xz compressed assets containing self-references
   someZstPackage = withCasper {
     relocateExtra = ''
-      find "$TARGET_DIR" -type f -name "*.zst" | while IFS= read -r zf; do
-        zstd -dc "$zf" | sed "s|$OLD_SELF|$NEW_SELF|g" | zstd -q > "$zf.casper-tmp"
+      find "$target" -type f -name "*.zst" | while IFS= read -r zf; do
+        zstd -dc "$zf" | sed "s|$old|$new|g" | zstd -q > "$zf.casper-tmp"
         mv "$zf.casper-tmp" "$zf"
       done
     '';
@@ -242,106 +227,98 @@ in {
 > [!TIP]
 > Notice `cat << 'EOF'` uses `#!/bin/sh` rather than `${prev.runtimeShell}` (`#!/nix/store/...-bash/bin/bash`). This ensures the custom script does not introduce an unwanted runtime store dependency on `bash` for data-only or minimal-closure outputs.
 
-### 5.3 Bootstrapping Strategies: Incremental vs. Full `stdenv` Bootstrap
+### 4.2 Bootstrapping Strategies: Incremental vs. Full `stdenv` Bootstrap
 
 #### Mode A: Incremental Bootstrap on Top of an Existing `/nix/store` (Fastest)
 - You do **not** have to rebuild `stdenv` from stage 0 just to start using CASPER with `nixpkgs`:
   - `localStore.resolveInputPath(inputPath)` in [`local-store.cc`](nix/src/libstore/local-store.cc#L1838-L1854) returns `inputPath` unchanged whenever a store path has no entry in the `PathRewrites` SQLite table.
-  - Therefore, pre-existing store paths in `/nix/store` (or paths substituted from `cache.nixos.org`) act as fixed leaves, while every **newly built** derivation goes through CASPER's blinding, content-hashing, and `relocate.sh` relocation.
+  - Therefore, pre-existing store paths in `/nix/store` (or paths substituted from `cache.nixos.org`) act as fixed leaves, while every **newly built** derivation goes through CASPER's streaming `NAR` $\to$ `NAR` blinding, content-hashing, and relocation.
 
 #### Mode B: Full End-to-End `stdenv` Bootstrap from `bootstrap-tools`
 When bootstrapping `nixpkgs` from scratch (`stdenvStages` 0 through final `stdenv`):
 1. **Stage 0 (`bootstrap-tools`)**:
-   - Downloaded as a fixed-output derivation (`CAFixed`), unpacked by `busybox` (`unpack-bootstrap-tools.sh`).
-   - Because its builder environment inside the sandbox only has the bootstrap `busybox` in `$PATH`, CASPER's default `relocate.sh` specifically uses POSIX `sh`, `find`, `sed`, `readlink`, `ln`, and `gzip`—all of which are applets provided by `bootstrap-tools` `busybox`.
+   - Downloaded as a fixed-output derivation (`CAFixed`), unpacked by `busybox` (`unpack-bootstrap-tools.sh`), and relocated in-process by C++ [`relocateNAR`](nix/src/libstore/build/derivation-builder-impl.cc#L108-L273) without requiring any external tools in the sandbox.
 2. **Static Libraries (`.a` Archives) Across Bootstrap Stages (`stage0` $\to$ `stage1` $\to$ `stage2` $\to$ `stage3` $\to$ `stdenv`)**:
    - Early GCC/glibc bootstrap stages build static `.a` archives (`libgcc.a`, `libc.a`).
-   - Standard `ar` archives store each member's byte size as a fixed-width decimal ASCII header and do not store member checksums. Because `<inputHash>` (32 chars), `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` (32 chars), and `<outHash>` (32 chars) have the exact same byte length, `sed` relocation inside `.a` archives preserves member sizes and symbol tables without needing `ranlib`.
+   - Standard `ar` archives store each member's byte size as a fixed-width decimal ASCII header and do not store member checksums. Because `<inputHash>` (32 chars), `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` (32 chars), and `<outHash>` (32 chars) have the exact same byte length, `RewritingSink` relocation inside `.a` archives preserves member sizes and symbol tables without needing `ranlib`.
 3. **Ecosystem-Level Hooks for Full Nixpkgs Coverage**:
    - Rather than overriding individual packages one by one, most non-plaintext formats in `nixpkgs` belong to language/framework ecosystems where a single hook covers thousands of packages:
      - **Python (`buildPythonPackage`)**: `*.dist-info/RECORD` files list SHA-256 hashes of installed entry-point scripts; when `relocate.sh` rewrites `$out` inside an entry-point script, `RECORD` either needs its hash updated or stripped.
      - **Haskell (`ghc` / `cabal`)**: `package.conf.d/package.cache` is a binary cache of `.conf` files containing `$out` paths; `relocate.sh` for GHC package DBs can re-run `ghc-pkg recache` or rewrite the binary cache.
      - **Linux Kernel Modules (`linux`)**: `.ko.xz` or `.ko.zst` modules that embed `$out` firmware/module paths need `xz`/`zstd` decompression/recompression in `relocate.sh`.
      - **Java / JVM (`.jar` / `.zip`)**: Unpacking/repacking `.jar` files only when `grep` detects a self-reference inside the uncompressed stream.
-     - **macOS (`darwin`)**: Mach-O binaries with ad-hoc code signatures invalidate their signature when `sed` modifies the `LC_RPATH` load command, requiring `codesign -f -s -` in `relocate.sh` on Darwin.
+     - **macOS (`darwin`)**: Mach-O binaries with ad-hoc code signatures invalidate their signature when rewriting the `LC_RPATH` load command, requiring `codesign -f -s -` in `relocate.sh` on Darwin.
 
-### 5.4 Real-World Bootstrap Verification (`casper-store`)
-Both Nixpkgs bootstrap chains were executed end-to-end into `casper-store` using `./build/src/nix/nix-build` and [`casper-overlay.nix`](casper-overlay.nix), producing **326 content-addressed derivation outputs** (`PathRewrites` rows in `casper-store/nix/var/nix/db/db.sqlite`):
+### 4.3 Real-World Bootstrap Verification (`casper-store`)
+Both Nixpkgs bootstrap chains were executed end-to-end into `casper-store` using `./nix/build/src/nix/nix-build` and [`casper-overlay.nix`](casper-overlay.nix), producing **313 relocated derivation outputs** (`PathRewrites` rows in `casper-store/nix/var/nix/db/db.sqlite`) that converged to **274 unique content-addressed outputs**:
 
-1. **Source-Only `stage0-posix` Bootstrap (50 Derivations)**:
-   - Built from the 181-byte `hex0-seed` (`stage0-posix-1.9.1-source`) through `hex0`, `kaem-minimal`, `hex1`, `hex2-0`, `catm`, `M0`, `cc_arch`, `M2-0`, `M2-Planet`, `blood-elf-0`, `M1-0`, `hex2-1`, `M1`, `hex2`, `kaem-0`, `kaem-unwrapped`, `get_machine`, `M2-Mesoplanet`, `mescc-tools`, `mescc-tools-extra`, and `kaem-1.9.1` (`/nix/store/hwsvl65h6p3xvbvzlc822pbdm17c2fz2-kaem-1.9.1`).
+1. **Source-Only `stage0-posix` Bootstrap (49 Derivations)**:
+   - Built from `hex0-1.6.0` (`stage0-posix-1.6.0-source`) through `hex1`, `hex2`, `catm`, `M0`, `cc_arch`, `M2-0`, `M2`, `blood-elf-0`, `M1-0`, `hex2-1`, `M1`, `hex2`, `kaem-unwrapped`, `mescc-tools`, `mescc-tools-extra`, and `kaem-1.6.0` (`/nix/store/5ac8fyvhhjj13m4r54kc53b6bbhy7nfw-kaem-1.6.0`).
 2. **Full Nixpkgs `stdenv` Bootstrap (`stage0` $\to$ `stage1` $\to$ `stage-xgcc` $\to$ `stage2` $\to$ `stage3` $\to$ `stage4` $\to$ `stdenv-linux` $\to$ `hello-2.12.2`)**:
-   - **276 `stdenv` bootstrap outputs** built, blinded, content-hashed, and relocated across all bootstrap stages without a single Nixpkgs package modification.
+   - **264 `stdenv` bootstrap outputs** built, blinded, content-hashed, and relocated across all bootstrap stages via the streaming `NAR` $\to$ `NAR` pipeline without a single Nixpkgs package modification.
 
 #### Key Bootstrap Milestones (`inputPath` $\to$ Content-Addressed `outputPath`)
 
 | Stage / Milestone | Evaluation Input Path (`<inputHash>-<name>`) | Relocated Content-Addressed Path (`<outHash>-<name>`) |
 | :--- | :--- | :--- |
-| **`stage0-posix` (`kaem-minimal`)** | `/nix/store/w6awxpyv6c7y11qd6c06awb33479psai-kaem-minimal-1.9.1` | `/nix/store/aidi65aijd1sm7arpcn7ygzzrd0b8l2z-kaem-minimal-1.9.1` |
-| **`stage0-posix` (`M2-1.9.1`)** | `/nix/store/c933x2407ahyia5bd2z39109zsk2q2b7-M2-1.9.1` | `/nix/store/xray0xlbj47j2z5vcg8br9ymqbbzzdx7-M2-1.9.1` |
-| **`stage0-posix` (`mescc-tools`)** | `/nix/store/53zd871rgpcvi7qmqkffxhzaiq0is7k4-mescc-tools-1.9.1` | `/nix/store/q4zr3lx94vhf6kwrc8lbn53c2w18parh-mescc-tools-1.9.1` |
-| **`stage0-posix` (`kaem-1.9.1`)** | `/nix/store/n3mfz1lj8rbz0cspkfrvxiy9h5hm0vzg-kaem-1.9.1` | `/nix/store/hwsvl65h6p3xvbvzlc822pbdm17c2fz2-kaem-1.9.1` |
-| **Stage 0 (`bootstrap-tools`)** | `/nix/store/razasrvdg7ckplfmvdxv4ia3wbayr94s-bootstrap-tools` | `/nix/store/hcpyl047bysqjd2zi3brjh1f16q2dfw3-bootstrap-tools` |
-| **Stage 0 (`stdenv-linux`)** | `/nix/store/ajrdf015k5ipn89gyh06isniabysrkcw-bootstrap-stage0-stdenv-linux` | `/nix/store/vzrj8hagnwndnsrcinqjikd2b14cz1z9-bootstrap-stage0-stdenv-linux` |
-| **Stage 1 (`stdenv-linux`)** | `/nix/store/wkqjkkwnwhs270sav1mrdz089cmydmj8-bootstrap-stage1-stdenv-linux` | `/nix/store/3cwdhwm2glcbzylpclsmxxgf5hgz49d1-bootstrap-stage1-stdenv-linux` |
-| **Stage xgcc (`xgcc-14.3.0`)** | `/nix/store/nvv5arlnf72xkvpnmnw78ywgdnvx92q3-xgcc-14.3.0` | `/nix/store/57cm6c8rrazz1qs347r3hngpk8dz2hn6-xgcc-14.3.0` |
-| **Stage xgcc (`stdenv-linux`)** | `/nix/store/azdg07c0qmzmj6cpnbpgmrh9gk1jl91d-bootstrap-stage-xgcc-stdenv-linux` | `/nix/store/lixszwy4ifspiqbbhg17ma9y151k7r73-bootstrap-stage-xgcc-stdenv-linux` |
-| **Stage 2 (`linux-headers-6.16.7`)** | `/nix/store/9a975kwlj5hyfq8y6hsapfaj5pj7g090-linux-headers-6.16.7` | `/nix/store/40adkqib01wb4mbplnaiwnw9k7smg421-linux-headers-6.16.7` |
-| **Stage 2 (`glibc-2.40-224`)** | `/nix/store/7nbi22pcc92y2fqbkyp7h3srvvklmckb-glibc-2.40-224` | `/nix/store/19zs62pdr843wg6gdlrv42pi9xsk7gin-glibc-2.40-224` |
-| **Stage 3 (`stdenv-linux`)** | `/nix/store/j7sbhs7c8wi0rxfh2f8wyngjdj5lb3z5-bootstrap-stage3-stdenv-linux` | `/nix/store/fik6cz8f1fy6ldhfywqk1ifjgv5pl4hn-bootstrap-stage3-stdenv-linux` |
-| **Stage 4 (`gcc-14.3.0`)** | `/nix/store/ipr6y28viyqkhkg58rdvy27m01q5j5nh-gcc-14.3.0` | `/nix/store/k2lwh4ajyg0kw6q0j930h89pqglzhg38-gcc-14.3.0` |
-| **Stage 4 (`coreutils-9.8`)** | `/nix/store/hqkszxk2c0cxvd04xa4gsaqs182dw8l2-coreutils-9.8` | `/nix/store/ldl68ax69n8r2qi2wm83jlhqdij4926w-coreutils-9.8` |
-| **Stage 4 (`bash-5.3p3`)** | `/nix/store/3hgg7pr65imdrifqqh3flg3arvkc2r22-bash-5.3p3` | `/nix/store/wwa5w1mjdd9qjbz3hdx2snjb99zcd3hh-bash-5.3p3` |
-| **Final `stdenv-linux`** | `/nix/store/0i25iw4373868kjqhafvmd6pn1wwzkh3-stdenv-linux` | `/nix/store/9xllz081w9xvs751j315jdpwr8y57vin-stdenv-linux` |
-| **Final `hello-2.12.2`** | `/nix/store/18bbdvag5v2f3d4y37pdbkzvh7s71cw4-hello-2.12.2` | `/nix/store/gwiy17v4i6l188kkwsmzk8ci1yla3y71-hello-2.12.2` |
+| **`stage0-posix` (`hex1-1.6.0`)** | `/nix/store/pvk596baqdg5hnmvnjsb1fbca6bz5j4v-hex1-1.6.0` | `/nix/store/3m87j2yh62phlzc3f5nhj4l0m75n55x1-hex1-1.6.0` |
+| **`stage0-posix` (`M2-1.6.0`)** | `/nix/store/3vmryl2mpq9rib67bi6clfvb44nym9jr-M2-1.6.0` | `/nix/store/f2xdw0rhj6k5a3dsirczd0gnlf53f50x-M2-1.6.0` |
+| **`stage0-posix` (`mescc-tools`)** | `/nix/store/k7847sdmcmfqvgpc7ycd5a4wpx49xan0-mescc-tools-1.6.0` | `/nix/store/97n0b1z6g61n330w9qn5r6b1mc4yawzl-mescc-tools-1.6.0` |
+| **`stage0-posix` (`kaem-1.6.0`)** | `/nix/store/9a0qmi15cidrn9kca5j820dw0qan13c8-kaem-1.6.0` | `/nix/store/5ac8fyvhhjj13m4r54kc53b6bbhy7nfw-kaem-1.6.0` |
+| **Stage 0 (`bootstrap-tools`)** | `/nix/store/razasrvdg7ckplfmvdxv4ia3wbayr94s-bootstrap-tools` | `/nix/store/30n2a6x7vsvxj1mzvrvhg8m89f41ci37-bootstrap-tools` |
+| **Stage 0 (`stdenv-linux`)** | `/nix/store/ajrdf015k5ipn89gyh06isniabysrkcw-bootstrap-stage0-stdenv-linux` | `/nix/store/s5j2ficvrlkjb6dhw9ay9zgglh573w98-bootstrap-stage0-stdenv-linux` |
+| **Stage 1 (`stdenv-linux`)** | `/nix/store/wkqjkkwnwhs270sav1mrdz089cmydmj8-bootstrap-stage1-stdenv-linux` | `/nix/store/dk3i95c49wjpsa5xc62cby077qk83y3a-bootstrap-stage1-stdenv-linux` |
+| **Stage xgcc (`xgcc-14.3.0`)** | `/nix/store/nvv5arlnf72xkvpnmnw78ywgdnvx92q3-xgcc-14.3.0` | `/nix/store/g5inkmc4j8pdclpyi2z37vszcr252wib-xgcc-14.3.0` |
+| **Stage xgcc (`stdenv-linux`)** | `/nix/store/azdg07c0qmzmj6cpnbpgmrh9gk1jl91d-bootstrap-stage-xgcc-stdenv-linux` | `/nix/store/75x0pfcacqpsf6h8ppd9fz983r08n69n-bootstrap-stage-xgcc-stdenv-linux` |
+| **Stage 2 (`linux-headers-6.16.7`)** | `/nix/store/9a975kwlj5hyfq8y6hsapfaj5pj7g090-linux-headers-6.16.7` | `/nix/store/b7xga9z9x1rbkj6agr51pgg9v4yf4d5w-linux-headers-6.16.7` |
+| **Stage 2 (`glibc-2.40-224`)** | `/nix/store/7nbi22pcc92y2fqbkyp7h3srvvklmckb-glibc-2.40-224` | `/nix/store/94f38yglcijsz5a8kv7hr3bz2w1is1r0-glibc-2.40-224` |
+| **Stage 3 (`stdenv-linux`)** | `/nix/store/j7sbhs7c8wi0rxfh2f8wyngjdj5lb3z5-bootstrap-stage3-stdenv-linux` | `/nix/store/rpnwisgkssmkndx9yamgvhgmh376ipb7-bootstrap-stage3-stdenv-linux` |
+| **Stage 4 (`gcc-14.3.0`)** | `/nix/store/ipr6y28viyqkhkg58rdvy27m01q5j5nh-gcc-14.3.0` | `/nix/store/ixh56dfh4lq5r87cfl8v3dv7q230hw0h-gcc-14.3.0` |
+| **Stage 4 (`coreutils-9.8`)** | `/nix/store/hqkszxk2c0cxvd04xa4gsaqs182dw8l2-coreutils-9.8` | `/nix/store/nkydbxdsfg1jjyli6mzz5ahfj3m6mj0h-coreutils-9.8` |
+| **Stage 4 (`bash-5.3p3`)** | `/nix/store/3hgg7pr65imdrifqqh3flg3arvkc2r22-bash-5.3p3` | `/nix/store/3894m0zrq35da26lpk0kk2lasdmc98vw-bash-5.3p3` |
+| **Final `stdenv-linux`** | `/nix/store/0i25iw4373868kjqhafvmd6pn1wwzkh3-stdenv-linux` | `/nix/store/5cbirwzcqq4rdwib11lh1k5rbz3xma8l-stdenv-linux` |
+| **Final `hello-2.12.2`** | `/nix/store/18bbdvag5v2f3d4y37pdbkzvh7s71cw4-hello-2.12.2` | `/nix/store/sn0pwh1agh2hnlbgm61ra3qr6yiz6ja8-hello-2.12.2` |
 
-#### Cross-Stage Content-Addressed Deduplication (21 Output Groups Across Stages 0–4)
-Querying `PathRewrites` in `casper-store/nix/var/nix/db/db.sqlite` showed **21 output groups** where derivations built across different bootstrap stages (with distinct `.drv` hashes and toolchains) produced identical blinded content and automatically converged to the exact same content-addressed store path:
+#### Cross-Stage Content-Addressed Deduplication (20 Output Groups Across Stages 0–4)
+Querying `PathRewrites` in `casper-store/nix/var/nix/db/db.sqlite` showed **20 output groups** (39 duplicate outputs eliminated) where derivations built across different bootstrap stages (with distinct `.drv` hashes and toolchains) produced identical blinded content and automatically converged to the exact same content-addressed store path:
 
 | Converged Content-Addressed `outputPath` | Stage Count | Distinct Input Hash Prefixes (`inputPath`) |
 | :--- | :---: | :--- |
-| `/nix/store/2blj7q9dnm0ibdrs0p94iwrs1fllcjw9-gnu-config-2024-01-01` | **6** | `nkp2jjfx`, `wqzpxm4j`, `y6alivz8`, `xdj1hdnn`, `nynfiaxg`, `ay97s1f2` |
-| `/nix/store/bxxzrvbxqacykv2q7l4kpjcj9bsq50ad-update-autotools-gnu-config-scripts-hook` | **6** | `ivs0xima`, `w3f3v1va`, `44bzap4q`, `zmbyl8wb`, `zxixwkhw`, `4s62rh5i` |
-| `/nix/store/3yhcvfbgmqpxwmi0qfmsj0hwb6mlqfwf-bash-5.3p3-man` | **5** | `vsrzjz05`, `83s5r9zn`, `irvzpqbc`, `3br10pn2`, `y3hrz22j` |
-| `/nix/store/hcg4s4ln3qdi28ckhmlzj6kma1cgzv4f-bash-5.3p3-doc` | **5** | `sidp11qn`, `5i8iqc88`, `sia47i7m`, `d5h5g51l`, `m569srhy` |
-| `/nix/store/myf5fcq8fg0ii4dljz8wpvpwkz3ylizm-bash-5.3p3-info` | **5** | `pqqcpb5q`, `4pz2asx9`, `k52n6fp4`, `ycy1vg2n`, `f4q2risa` |
-| `/nix/store/789x2039dz9f18szdxi11mvm6y0w4k0f-nuke-references` | **4** | `rxxjh38q`, `wwiqgin8`, `jrabk1pr`, `2kh0hlwq` |
-| `/nix/store/2798izy25ppzci92q88ff8spvrgad8rx-mpfr-4.2.2-info` | **3** | `s6w6ji55`, `y6389270`, `5fmqqppa` |
-| `/nix/store/n2ihhd84xqakpwi8mgpp0jigln4mhrbn-mpfr-4.2.2-doc` | **3** | `3m1319j9`, `m987c7y9`, `fiqrdsdy` |
-| `/nix/store/x8zr8fz0n8g2pnq508xmbncgdviwya0l-expand-response-params` | **2** | `gk36k5fd`, `bzkq151p` *(compiled C binary deduplicated across stages)* |
-| `/nix/store/cr6hr5ds4lbx3y79x6ani29a4p18aqwv-bash-5.3p3-debug` | **2** | `2hg82qsg`, `i7p4sb8d` |
-| `/nix/store/0f44wkcgrkzh6520xhyy5l65nddbrc5c-binutils-2.44-man` | **2** | `2b43ga3y`, `5951bdp9` |
-| `/nix/store/1g21g21qal66isv16by0d25a0ziqzzrd-binutils-2.44-info` | **2** | `b4b5lfds`, `ynws37nl` |
-| `/nix/store/bg1j2ibpmnl2j0r593lib5vh2zhz7iyw-binutils-wrapper-2.44-man` | **2** | `641ksb94`, `iwh74pj4` |
-| `/nix/store/qlc6cqhhcbczxgr6p5i23mhws9b77ayl-binutils-wrapper-2.44-info` | **2** | `0s7vn1v9`, `fmf1v6h8` |
-| `/nix/store/bmh08hmsvy5sddbi9fjnviixwll5dxxs-python-setup-hook.sh` | **2** | `4441jg4a`, `1ay695zg` |
-| `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-6.3.0-info` | **2** | `3g3f04ja`, `a945qkvw` *(shares hash `j1zgcfidm58ay0zxcc724ciwxv6mwn91` with `gmp-with-cxx`)* |
-| `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-with-cxx-6.3.0-info` | **2** | `8arwbp01`, `jw6fiway` |
-| `/nix/store/n0ab0gfyylp1rfn0hi0l6x8zjnmm89j2-xz-5.8.3-doc` | **2** | `x4qgpmhz`, `h4ch4ldb` |
-| `/nix/store/pccswiggmljfpbsb57kjg50amd348s2s-xz-5.8.3-man` | **2** | `yzci0g7r`, `34qc1s1k` |
-| `/nix/store/wrlw3mbzw3z837l8zxg5qhc9a1yrkxfp-libxcrypt-4.5.2-man` | **2** | `cc7r666h`, `yhficm51` |
-| `/nix/store/zzwm1znl9jads26r32p6i3h3xifdyxld-gettext-0.25.1-info` | **2** | `nky8g413`, `wripq293` |
+| `/nix/store/h2zm8gx40nhw8sj8757xh5pcpglw8gnb-gnu-config-2024-01-01` | **6** | `nkp2jjfx`, `wqzpxm4j`, `y6alivz8`, `xdj1hdnn`, `nynfiaxg`, `ay97s1f2` |
+| `/nix/store/1sid5bc540bia6li9ggk7sc7di5nm89h-update-autotools-gnu-config-scripts-hook` | **6** | `ivs0xima`, `w3f3v1va`, `44bzap4q`, `zmbyl8wb`, `zxixwkhw`, `4s62rh5i` |
+| `/nix/store/isksmxafyj4ldqkn6zwbrz4cq1rp7qxz-bash-5.3p3-info` | **5** | `pqqcpb5q`, `4pz2asx9`, `k52n6fp4`, `ycy1vg2n`, `f4q2risa` |
+| `/nix/store/mflf4dq4x1wmsglpra9gsnq49z8an7mf-bash-5.3p3-man` | **5** | `vsrzjz05`, `83s5r9zn`, `irvzpqbc`, `3br10pn2`, `y3hrz22j` |
+| `/nix/store/xdkj3ydj7q3px091xay4wx9hgwl8hidx-bash-5.3p3-doc` | **5** | `sidp11qn`, `5i8iqc88`, `sia47i7m`, `d5h5g51l`, `m569srhy` |
+| `/nix/store/ii3700nq7nnfhp8zfssjczarw60izsdv-nuke-references` | **4** | `rxxjh38q`, `wwiqgin8`, `jrabk1pr`, `2kh0hlwq` |
+| `/nix/store/0xz45i1lvf06pjxydpddid2nglir332r-expand-response-params` | **2** | `gk36k5fd`, `bzkq151p` *(compiled C binary deduplicated across stages)* |
+| `/nix/store/kcrsbmlryh3rjgmx1ns9lrshsj3i6zxs-bash-5.3p3-debug` | **2** | `2hg82qsg`, `i7p4sb8d` |
+| `/nix/store/78x0j5kl28kgf46699s3pisjafbax3j0-binutils-2.44-man` | **2** | `2b43ga3y`, `5951bdp9` |
+| `/nix/store/k8yn35adnbq8vivkljg6bjb10lh5bwfx-binutils-2.44-info` | **2** | `b4b5lfds`, `ynws37nl` |
+| `/nix/store/6i8rmmr9b3w6nfm1mbad4a8rj05ykjb8-binutils-wrapper-2.44-man` | **2** | `641ksb94`, `iwh74pj4` |
+| `/nix/store/5ddi5vhhma11h30v7mqa5b9ipq63fqcj-binutils-wrapper-2.44-info` | **2** | `0s7vn1v9`, `fmf1v6h8` |
+| `/nix/store/8w7bd80468acw2ki886x4mcz9jw52b13-python-setup-hook.sh` | **2** | `4441jg4a`, `1ay695zg` |
+| `/nix/store/p8mqjin5gf9acxzdgk722ylh6d50vxis-gmp-6.3.0-info` | **2** | `3g3f04ja`, `a945qkvw` *(distinct from `2ypdc6zv6xxgg65aykz0177m9wgn4rga-gmp-with-cxx-6.3.0-info` via name-mixed `casper:out` derivation)* |
+| `/nix/store/r2dg2j6svx26z7z9kkp6b5laskkxmr21-mpfr-4.2.2-doc` | **2** | `3m1319j9`, `fiqrdsdy` |
+| `/nix/store/wc4dm2kbkipfx437qa39aq0kc39q1lxd-mpfr-4.2.2-info` | **2** | `s6w6ji55`, `5fmqqppa` |
+| `/nix/store/3zpq1q2dnsklbf41wlvfkx8rwjf2s8d4-xz-5.8.3-doc` | **2** | `x4qgpmhz`, `h4ch4ldb` |
+| `/nix/store/2kfnv0hyikydq1mmfpqh7ld64wq96fdl-xz-5.8.3-man` | **2** | `yzci0g7r`, `34qc1s1k` |
+| `/nix/store/29a0hwkx4wfj3xbiz5233gqg9g1g6qwh-libxcrypt-4.5.2-man` | **2** | `cc7r666h`, `yhficm51` |
+| `/nix/store/fzm5c1csn6slg3zsb850lznsy96mg52k-gettext-0.25.1-info` | **2** | `nky8g413`, `wripq293` |
 
 #### Key Technical Findings from the Real Bootstrap
-1. **Early `minimal-bootstrap` Sandbox Constraints (`kaem` & `mes-libc`)**:
-   - In `minimal-bootstrap` (`stage0-posix`), early derivations (`kaem-minimal`, `M1`, `hex2`, `M2-Planet`, `blood-elf-0`) execute in a bare sandbox with **no `/bin/sh`, `find`, or `sed`**, and many outputs are single regular executable files (`S_ISREG`) rather than directories (`S_ISDIR`).
-   - By checking `bool needRelocateScript = hasCustomRelocate || hasGzFiles(actualPath)` in [`DerivationBuilderImpl::registerOutputs`](nix/src/libstore/build/derivation-builder-impl.cc#L635) and running C++ [`rewritePathInPlace`](nix/src/libstore/build/derivation-builder-impl.cc#L204-L243) on all non-`.gz` files and symlinks, early `stage0-posix` derivations without `/bin/sh` relocate in-process while large `stdenv` packages (`gcc`, `glibc`, `perl`, `python3`) avoid unnecessary subshell invocations whenever no `.gz` files or custom hooks are present.
+1. **Zero Injected Files & Pure `NAR` $\to$ `NAR` In-Process Stream Relocation**:
+   - In `minimal-bootstrap` (`stage0-posix`), early derivations (`hex1`, `hex2`, `M0`, `M2`, `blood-elf-0`) execute in a bare sandbox with **no `/bin/sh`, `find`, or `sed`**, and many outputs are single regular executable files (`S_ISREG`) rather than directories (`S_ISDIR`).
+   - Because [`relocateNAR`](nix/src/libstore/build/derivation-builder-impl.cc#L108-L273) operates directly on the NAR stream in C++ (including in-memory `.gz` decompression, rewriting, and deterministic `gzip -n` recompression) and only spawns `$out/nix-support/relocate.sh` when a package explicitly provides one, all 313 bootstrap outputs relocated in-process without injecting any extra files into `$out`.
 2. **Selective Binary Cache Substitution (`type(*drv).isCA()`)**:
-   - Standard binary caches (`cache.nixos.org`) index input-addressed derivations by `<inputHash>-<name>` (without CASPER relocation or `$out/nix-support/{relocate,hash}.sh`), whereas `CAFixed` derivations (source tarballs, `bootstrap-tools.tar.xz`, `stage0-posix` seeds) are indexed by fixed content hash.
+   - Standard binary caches (`cache.nixos.org`) index input-addressed derivations by `<inputHash>-<name>`, whereas `CAFixed` derivations (source tarballs, `bootstrap-tools.tar.xz`, `stage0-posix` seeds) are indexed by fixed content hash.
    - Restricting binary cache substitution to `type(*drv).isCA()` in [`DerivationGoal::haveDerivation`](nix/src/libstore/build/derivation-goal.cc#L93) and [`Store::queryMissing`](nix/src/libstore/misc.cc#L268) allows CASPER to fetch fixed-output source tarballs from `cache.nixos.org` while building and relocating all input-addressed derivations locally.
 3. **Resolving `allowedReferences` & `disallowedRequisites` After Relocation**:
    - Foundational packages in `nixpkgs` (`glibc-2.40-224`, `gcc-14.3.0`, `bootstrap-stage*-stdenv-linux`) specify strict `allowedReferences`, `allowedRequisites`, `disallowedReferences`, and `disallowedRequisites` lists containing evaluation-time `<inputHash>-<name>` store paths.
    - Updating [`checkOutputs`](nix/src/libstore/build/derivation-check.cc#L23-L52) to resolve those paths through `store.resolveInputPath` (and the current derivation's `outputs` map) allowed every bootstrap stage's reference checks to pass without modifying `nixpkgs`.
-4. **Single-Inode Hardlink Deduplication & Post-Build `hash.sh` Verification**:
-   - All **224 directory outputs** in `casper-store/nix/store` share a single inode (`st_nlink = 224`) for their default `relocate.sh` and `hash.sh` scripts via `/nix/store/.links`.
-   - Running `$out/nix-support/hash.sh` on the final relocated outputs (`hello-2.12.2`, `stdenv-linux`, `glibc-2.40-224`, `coreutils-9.8`, `bash-5.3p3`, and `kaem-1.9.1`) reproduced the exact 32-character store hash of every package.
-5. **Empirical `.gz` Recompression in the Bootstrap (1,797 `.gz` Files Across 49 Outputs)**:
-   - Scanning all **1,797 `.gz` files** across the **49 store outputs** containing `.gz` files in `casper-store/nix/store` (such as 233 `/share/i18n/charmaps/*.gz` files in `glibc-2.40-224` and 942 `.gz` manpages in `perl-5.40.0-{man,devdoc}`) revealed:
-     - **0 / 1,797 `.gz` files** contained a direct self-reference (`$out` inside `$out/.../*.gz`).
-     - **7 / 1,797 `.gz` files** contained **sibling-output references** (`$out` inside `$man/.../*.gz`) in multi-output packages (`outputs = [ "out" "man" ... ]`), and were **actually decompressed, rewritten, and recompressed by `relocate.sh`** during the `outputRewrites` pass in [`DerivationBuilderImpl::registerOutputs`](nix/src/libstore/build/derivation-builder-impl.cc#L637-L644):
-       1. `1da2vxfyy8ljcrx4wf67rg88a6gggmr4-file-5.45-man`: `share/man/man1/file.1.gz`, `share/man/man3/libmagic.3.gz`, and `share/man/man4/magic.4.gz` (rewrote `/nix/store/018l43lbsqbrsasrfdcxxb5s4s161fkr-file-5.45/share/misc/magic*` $\to$ `/nix/store/ii3dgjf5194qhahl30abz3crdxrww393-file-5.45/share/misc/magic*`).
-       2. `ni6al73yw59fja66pgzzxkw8yrszrh84-gettext-0.25.1-man` (Stage 3): `share/man/man1/gettext.1.gz` and `share/man/man1/ngettext.1.gz` (rewrote `/nix/store/qawh4dvis37x3nvvsd1n53v13gy9yq9g-gettext-0.25.1/share/locale` $\to$ `/nix/store/4f2935wyhfa0hgi2m91p24i2933hbix2-gettext-0.25.1/share/locale`).
-       3. `rdwrpqbjbrm5s59x0blsrbb2yv1bkb9m-gettext-0.25.1-man` (Stage 4): `share/man/man1/gettext.1.gz` and `share/man/man1/ngettext.1.gz` (rewrote `/nix/store/yfnzmmv8r4wzgg2f0fci4xl874lm7w5x-gettext-0.25.1/share/locale` $\to$ `/nix/store/gxlsy3z1w3qdnsg4gj87a9y9lwi343vg-gettext-0.25.1/share/locale`).
-     - Because Nix's `scanForReferences` only scans uncompressed bytes, the bootstrap would still have succeeded without `.gz` recompression, but those 7 manpages would have retained stale input hashes inside their compressed streams (and failed to converge if `$out`'s input hash changed). Conversely, the remaining **277 outputs** without `.gz` files or custom hooks bypassed `runRelocateScript` completely via [`needRelocateScript = hasCustomRelocate || hasGzFiles(actualPath)`](nix/src/libstore/build/derivation-builder-impl.cc#L635) and relocated purely in-process via [`rewritePathInPlace`](nix/src/libstore/build/derivation-builder-impl.cc#L204-L243).
+4. **Empirical `.gz` Recompression in the Bootstrap**:
+   - Multi-output packages (`outputs = [ "out" "man" ... ]`) whose `.gz` manpages embed sibling `$out` references were automatically detected during the pre-sort sibling scan, topologically ordered after `$out`, and rewritten in-stream by [`relocateNAR`](nix/src/libstore/build/derivation-builder-impl.cc#L172-L205):
+     1. `rzkzgcpi35061aphd7nvw9q4567ws09d-file-5.45-man`: `share/man/man1/file.1.gz`, `share/man/man3/libmagic.3.gz`, and `share/man/man4/magic.4.gz` (rewrote `/nix/store/018l43lbsqbrsasrfdcxxb5s4s161fkr-file-5.45/share/misc/magic*` $\to$ `/nix/store/40xf2hs1hr0934ad6a5w1kb6krc16g7a-file-5.45/share/misc/magic*`).
+     2. `vbrchwv2wc4s32cdnf6ns12b751b5v3f-gettext-0.25.1-man` (Stage 3): `share/man/man1/gettext.1.gz` and `share/man/man1/ngettext.1.gz` (rewrote `/nix/store/qawh4dvis37x3nvvsd1n53v13gy9yq9g-gettext-0.25.1/share/locale` $\to$ `/nix/store/mj7f7qmykivmz7cmwq62gn0zd5w173is-gettext-0.25.1/share/locale`).
+     3. `8gjj4hnbj7fr4bfyd2yp5bfvbx5lh7d7-gettext-0.25.1-man` (Stage 4): `share/man/man1/gettext.1.gz` and `share/man/man1/ngettext.1.gz` (rewrote `/nix/store/yfnzmmv8r4wzgg2f0fci4xl874lm7w5x-gettext-0.25.1/share/locale` $\to$ `/nix/store/6jz09pa69k6nfijv6ij5laf6k4m8qh2z-gettext-0.25.1/share/locale`).
 
 
