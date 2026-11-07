@@ -29,7 +29,8 @@ One way to sidestep the self-reference loop without rewriting package contents i
    - In CASPER, an output's content address `<output-hash>` is defined not as the raw SHA-256 hash of the final output, but as the SHA-256 hash of the **partially blinded** output. Because the placeholder is independent of both `<input-hash>` and `<output-hash>`, the hash loop disappears, and two derivations with different input hashes that produce identical blinded content converge to the exact same `<output-hash>`.
 
 2. **Delegating Partial Blinding & Relocation to the Derivation Itself (Embedded Relocation)**:
-   - Why can't Nix simply perform partial blinding in C++ using a naive byte-string search-and-replace? Because in real software packages, self-references are not always stored in uncompressed plaintext! Consider a `.gz`-compressed manpage or archive inside `$out` that embeds `/nix/store/<input-hash>-<name>`: a naive byte-string blinder scanning raw file bytes will never see the reference inside the compressed Deflate bitstream and therefore cannot blind or relocate it.
+   - Why can't Nix simply perform partial blinding in C++ using a naive byte-string search-and-replace? Because in real software packages, self-references are not always stored in uncompressed plaintext. Consider a `.gz`-compressed manpage or archive inside `$out` that embeds `/nix/store/<input-hash>-<name>`: a naive byte-string blinder scanning raw file bytes will never see the reference inside the compressed Deflate bitstream and therefore cannot blind or relocate it.
+   - While we could special-case `.gz` files in Nix itself, this is undesirable as so many versions of hidden references could exist. It is up to the software packager to fix those up.
    - CASPER's second invention is to **delegate the task of blinding and relocating self-references to the derivation output itself**, by embedding a relocator (`$out/nix-support/relocate.sh`) inside the output.
    - Crucially, embedding the blinder/relocator inside the output **does not re-introduce the hash loop**: the task of blinding and relocating can be defined **abstractly** (`relocate.sh <old-self> <new-self>`, taking the source and target store-path strings as parameters) without making any concrete reference to `<input-hash>` or `<output-hash>` inside the script itself. Because the relocator's own bytes remain completely invariant across blinding and relocation, it can live inside `$out` and be hashed alongside the rest of the partially blinded output without causing a hash cycle.
 
@@ -83,13 +84,13 @@ With `relocate.sh` normalizing self-references before hashing and rewriting them
    - Blinding is **strictly scoped to self-references** (`<input-hash>-<name>` $\to$ `<blind-hash>-<name>`). Dependency references (`/nix/store/<dep-out-hash>-<dep-name>`) already have their final content-addressed hashes and are never blinded.
    - **Step 2a + 2b (In-Stream Blinding & Content Hashing—Zero Disk Writes)**:
      - The outer layer serializes `$out` into a NAR stream (`dumpPath($out)`), pipes it into `relocate.sh "<input-hash>-<name>" "<blind-hash>-<name>"`, and pipes `stdout` **directly into Nix's C++ SHA-256 `HashSink`** (compressing the digest to 20 bytes / 32 Nix32 chars to obtain `<output-hash>`, e.g. `fahxx11...`).
-     - Because self-references were blinded in the NAR stream first (even inside `.gz` entries), two builds with different input hashes that produce the same content yield the **exact same `<output-hash>`** without writing a blinded copy to disk!
+     - Because self-references were blinded in the NAR stream first (even inside `.gz` entries), two builds with different input hashes that produce the same content yield the **exact same `<output-hash>`** without writing a blinded copy to disk.
    - **Step 2c (In-Stream Relocation + Trusted Outer-Layer NAR Unpacking & Reference Scan)**:
      - The outer layer pipes the NAR through `relocate.sh "<blind-hash>-<name>" "<output-hash>-<name>"` and feeds `stdout` directly into Nix's C++ `TeeSink(RestoreSink("/nix/store/<output-hash>-<name>"), HashAndRefScanSink)`—simultaneously unpacking the final output to `/nix/store/fahxx11...-foo-1.2.3`, computing its final `narHash`/`narSize`, and scanning the final uncompressed NAR stream for store references.
 3. **Downstream Dependency Rewriting in Builder Args & Env**:
    - When a downstream derivation `bar` (which depends on `foo`) was evaluated, its `.drv` recorded `foo`'s input-addressed path `/nix/store/abcdef...-foo-1.2.3`.
    - Before `bar` is built, Nix looks up the realised output path of `foo` (`/nix/store/fahxx11...-foo-1.2.3`) and rewrites `abcdef...` -> `fahxx11...` in `bar`'s builder arguments (`drv.args`), environment variables (`drv.env`), structured attrs / extra files, and sandbox `inputPaths`.
-   - Thus `bar` builds directly against `/nix/store/fahxx11...-foo-1.2.3`—no symlinks in `/nix/store` are required!
+   - Thus `bar` builds directly against `/nix/store/fahxx11...-foo-1.2.3`—no symlinks in `/nix/store` are required.
 
 ```mermaid
 flowchart TD
@@ -116,7 +117,7 @@ Instead of mutating a directory tree in place on the host filesystem, `relocate`
 #### Why `NAR` $\to$ `NAR` Takes Precedence Over In-Place Directory Mutation
 1. **Uncompressed NARs Can Be Relocated as a Raw Byte Stream ($O(1)$ Memory)**:
    - In the NAR wire format, every regular file body, symlink target, and filename is stored as a contiguous byte slice preceded by a 64-bit little-endian length prefix and padded to an 8-byte boundary.
-   - Because `<oldHash>-<name>` and `<newHash>-<name>` have the **exact same byte length**, replacing `<oldHash>-<name>` $\to$ `<newHash>-<name>` inside any uncompressed file or symlink **never alters any 64-bit length prefix or 8-byte alignment padding**!
+   - Because `<oldHash>-<name>` and `<newHash>-<name>` have the **exact same byte length**, replacing `<oldHash>-<name>` $\to$ `<newHash>-<name>` inside any uncompressed file or symlink **never alters any 64-bit length prefix or 8-byte alignment padding**.
    - Only compressed entries (such as `.gz`, where re-running `gzip -n` after rewriting a hash can change the compressed byte size by a few bytes) require updating that entry's 64-bit NAR length field.
 2. **Zero Disk Writes During Blinding & Content Hashing**:
    - **Pass 1 (In-Stream Blind + Hash)**: The outer layer serializes `$out` once (`dumpPath($out)`), pipes it into `relocate.sh "<inputHash>-<name>" "<blindHash>-<name>"`, and streams `stdout` **directly into Nix's C++ `HashSink(HashAlgorithm::SHA256)`** to compute `outHash = compressHash(narHash, 20)`—without ever unpacking the blinded tree to disk.
@@ -275,7 +276,7 @@ Inside `UnixDerivationBuilderImpl` / `ChrootLinuxDerivationBuilder` and [`Deriva
 - **Why Discarded**:
   1. **Opens the Hostile / Weak Hasher Security Hole (`echo <static-hash>`)**:
      - If a derivation can bundle a custom `$out/nix-support/hash.sh` and Nix trusts its output as `<output-hash>`, a broken or hostile derivation (`evil-glibc`) can decouple **the digest Nix uses for the store path** from **the actual bytes in `$out`**.
-     - Specifically, `evil-glibc` can predict legitimate `glibc-2.40-224`'s hash (`19zs62pdr843wg6gdlrv42pi9xsk7gin`), write `echo "19zs62pdr843wg6gdlrv42pi9xsk7gin"` in `hash.sh`, and install a malicious `libc.so.6` directly into `/nix/store/19zs62pdr843wg6gdlrv42pi9xsk7gin-glibc-2.40-224`!
+     - Specifically, `evil-glibc` can predict legitimate `glibc-2.40-224`'s hash (`19zs62pdr843wg6gdlrv42pi9xsk7gin`), write `echo "19zs62pdr843wg6gdlrv42pi9xsk7gin"` in `hash.sh`, and install a malicious `libc.so.6` directly into `/nix/store/19zs62pdr843wg6gdlrv42pi9xsk7gin-glibc-2.40-224`.
      - Even if defended by requiring custom `hash.sh` to be a symlink to an external store dependency whose closure hash $H_{\text{closure}}$ is cryptographically combined with $H_{\text{content}}$ ($\text{SHA256}(H_{\text{closure}} \parallel H_{\text{content}})$), eliminating `hash.sh` altogether removes the attack surface completely.
   2. **In-Place Normalization (`postInstall` / `postFixup`) Is Strictly Superior to Temporary-Copy Blinding**:
      - When `hash.sh` strips a non-deterministic build year or timestamp on a temporary copy, two builds from different dates get the same store hash even though their actual installed files in `/nix/store` still differ.
@@ -327,7 +328,7 @@ Inside `UnixDerivationBuilderImpl` / `ChrootLinuxDerivationBuilder` and [`Deriva
   3. Run `relocate.sh` on the second build to blind `/nix/store/<input-hash>-foo-recheck` $\to$ `/nix/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-foo`, and compute the blinded output hash $H_2$.
   4. **Compare $H_1$ vs. $H_2$**:
      - If `relocate.sh` caught **every** self-reference, both blinded trees will be byte-for-byte identical and $H_1 = H_2$.
-     - If the build embedded `$out` inside an unhandled format (e.g., an `.xz` archive or binary cache that `relocate.sh` did not unpack), the `-recheck` suffix remains inside that file after `relocate.sh` runs, causing $H_1 \neq H_2$!
+     - If the build embedded `$out` inside an unhandled format (e.g., an `.xz` archive or binary cache that `relocate.sh` did not unpack), the `-recheck` suffix remains inside that file after `relocate.sh` runs, causing $H_1 \neq H_2$.
      - Comparing the two blinded trees immediately alerts the packager to the incomplete `relocate.sh` and pinpoints the exact file containing the hidden self-reference.
 
 ### 6.3 Security Threat Model: Sandbox Bait-and-Switch in `relocate.sh` and Closure-Bound External Relocators
@@ -335,13 +336,13 @@ Inside `UnixDerivationBuilderImpl` / `ChrootLinuxDerivationBuilder` and [`Deriva
 Even after discarding `hash.sh` (Section 5.2) so that Nix always computes the SHA-256 NAR hash directly in C++ over the blinded output at Step 2b, what if a malicious derivation tries to pull a bait-and-switch between **Pass 1** (blinding before hashing) and **Pass 2** (relocating after hashing)?
 - **Why the bait-and-switch cannot remain inside `$out` at Step 2b (and the Self-Erasing `relocate.sh` Bypass)**:
   - Because `$out/nix-support/relocate.sh` is inside `$out`, it is included in the C++ NAR SHA-256 hash at Step 2b. If `$out/nix-support/relocate.sh` still differs by even a single byte at Step 2b (or if a second copy of `libc.so.6` is still stashed inside `$out`), the NAR hash at Step 2b changes and **will not match** legitimate `glibc`'s hash. At Step 2b, the entire `$out` directory must be byte-for-byte identical to legitimate blinded `glibc`.
-  - **However**, in the directory-mutating prototype ([`DerivationBuilderImpl::registerOutputs`](nix/src/libstore/build/derivation-builder-impl.cc#L621-L670)), `hasCustomRelocate` is latched *before* Pass 1 (line 622) and `needRelocateScript` is cached at line 635. A malicious custom `$out/nix-support/relocate.sh` can therefore execute during **Pass 1**, spawn a background process or stage a trigger in `/build`, and **overwrite `$out/nix-support/relocate.sh` with `defaultRelocateScript`** before exiting Pass 1—so `$out` is 100% identical to legitimate blinded `glibc` during Step 2b, yet `needRelocateScript` remains `true` for Pass 2!
+  - **However**, in the directory-mutating prototype ([`DerivationBuilderImpl::registerOutputs`](nix/src/libstore/build/derivation-builder-impl.cc#L621-L670)), `hasCustomRelocate` is latched *before* Pass 1 (line 622) and `needRelocateScript` is cached at line 635. A malicious custom `$out/nix-support/relocate.sh` can therefore execute during **Pass 1**, spawn a background process or stage a trigger in `/build`, and **overwrite `$out/nix-support/relocate.sh` with `defaultRelocateScript`** before exiting Pass 1—so `$out` is 100% identical to legitimate blinded `glibc` during Step 2b, yet `needRelocateScript` remains `true` for Pass 2.
 - **Where the post-Step-2b trigger lives if run inside the build sandbox: `/build` (`$NIX_BUILD_TOP`) + `$PATH`**:
   - Although `$out` must be identical to legitimate blinded `glibc` at Step 2b, the build sandbox outside `$out` is not covered by `$out`'s NAR hash:
     1. **The payload stash in `/build`**: The attacker's derivation declares legitimate `glibc` as an input dependency, copies legitimate `glibc` into `$out`, and stashes a malicious `libc.so.6` in `/build/evil-libc.so.6`.
     2. **The trigger in `$PATH`**: Legitimate `glibc`'s `$out/nix-support/relocate.sh` uses `#!/bin/sh` and invokes `find`, `grep`, and `sed` via `$PATH`. The attacker leaves `$out/nix-support/relocate.sh` untouched, but sets `PATH=/build/evil-bin:...` in the derivation environment.
     3. During **Pass 1** (`relocate.sh <inputHash> xxxx...`), `/build/evil-bin/sed` performs normal blinding so Step 2b hashes pure blinded `glibc` $\to$ `19zs62pdr843wg6gdlrv42pi9xsk7gin`.
-    4. During **Pass 2** (`relocate.sh xxxx... 19zs62pdr843wg6gdlrv42pi9xsk7gin`), `/build/evil-bin/sed` detects that `$1` is `xxxx...` (the post-hash pass!) and injects `/build/evil-libc.so.6` into `$out/lib/libc.so.6` *after* the store path hash `19zs62pdr843wg6gdlrv42pi9xsk7gin` has already been chosen!
+    4. During **Pass 2** (`relocate.sh xxxx... 19zs62pdr843wg6gdlrv42pi9xsk7gin`), `/build/evil-bin/sed` detects that `$1` is `xxxx...` (the post-hash pass) and injects `/build/evil-libc.so.6` into `$out/lib/libc.so.6` *after* the store path hash `19zs62pdr843wg6gdlrv42pi9xsk7gin` has already been chosen.
 - **Defense (Closure-Bound External Relocators + Isolated `NAR` $\to$ `NAR` Sandbox)**:
   - If `$out/nix-support/relocate.sh` is absent, Nix uses its built-in relocator and never executes untrusted code.
   - If `$out/nix-support/relocate.sh` is present, it must be verified as a **symlink pointing to an external store dependency** $P_{\text{reloc}}$, executed in a fresh `NAR` $\to$ `NAR` (`stdin` $\to$ `stdout`) sandbox with `/build` unmounted and `$PATH` restricted to $P_{\text{reloc}}$'s store closure, and the cryptographic hash of $P_{\text{reloc}}$'s Nix closure ($H_{\text{closure}} = \text{SHA256}(\text{closure}(P_{\text{reloc}}))$) is combined with the blinded NAR hash:
@@ -369,7 +370,7 @@ Even after discarding `hash.sh` (Section 5.2) so that Nix always computes the SH
          hashes.insert(hashPart);
      }
      ```
-   - **Daemon Crash (DoS) & Reference Confusion**: If any downstream derivation includes two store paths with the same 32-character `hashPart` in `referenceablePaths`, **`assert(inserted)` aborts the `nix-daemon` process (`SIGABRT`)**! Even without the assertion, `RefScanSink` only scans for 32-char hashes and cannot distinguish a reference to `<hash>-foo` from `<hash>-bar`.
+   - **Daemon Crash (DoS) & Reference Confusion**: If any downstream derivation includes two store paths with the same 32-character `hashPart` in `referenceablePaths`, **`assert(inserted)` aborts the `nix-daemon` process (`SIGABRT`)**. Even without the assertion, `RefScanSink` only scans for 32-char hashes and cannot distinguish a reference to `<hash>-foo` from `<hash>-bar`.
    - **Mitigation**: Mix `name` (and `references`) into the hash before compressing to 20 bytes (matching `StoreDirConfig::makeStorePath`: `SHA256("casper:out:sha256:" + narHash + ":" + storeDir + ":" + name)`).
 
 3. **Reference Scanner Desynchronization (`scanForReferences` Runs *Before* `relocate.sh`, Never After)**:
@@ -433,7 +434,7 @@ Ideally, `relocate.sh` ($R(T, \text{old}, \text{new})$) would behave as a pure, 
 ### 7.1 Why Hardlinks (`/nix/store/.links`) Beat Symlinks for Default `relocate.sh`
 - **The Symlink Trap (`allowedReferences = []`)**:
   - At first glance, embedding a default `relocate.sh` via a symlink (`$out/nix-support/relocate.sh -> /nix/store/<hash>-casper-scripts/relocate.sh`) looks like an attractive way to avoid duplicating script files across thousands of store outputs.
-  - However, Nix's reference scanner (`scanForReferences`) scans symlink targets! A symlink pointing to `/nix/store/<hash>-casper-scripts` makes `casper-scripts` a runtime store dependency of **every single output in the store**.
+  - However, Nix's reference scanner (`scanForReferences`) scans symlink targets. A symlink pointing to `/nix/store/<hash>-casper-scripts` makes `casper-scripts` a runtime store dependency of **every single output in the store**.
   - In `nixpkgs`, foundational packages—including `bootstrap-tools`, `glibc`, `tzdata`, `iana-etc`, and raw source/data directories—enforce `allowedReferences = [];` or `allowedReferences = [ "out" ];`. Adding an extra store reference causes Nix to immediately fail those builds.
 - **The Solution: Static `#!/bin/sh` File + Store Hardlink Deduplication**:
   - Instead of symlinking to another store path, CASPER's C++ `DerivationBuilder` (`registerOutputs` in [`derivation-builder-impl.cc`](nix/src/libstore/build/derivation-builder-impl.cc#L186-L246)) automatically writes a static, byte-for-byte identical `#!/bin/sh` script into `$out/nix-support/relocate.sh` whenever the builder did not provide a custom one.
@@ -572,14 +573,14 @@ Querying `PathRewrites` in `casper-store/nix/var/nix/db/db.sqlite` showed **21 o
 | `/nix/store/789x2039dz9f18szdxi11mvm6y0w4k0f-nuke-references` | **4** | `rxxjh38q`, `wwiqgin8`, `jrabk1pr`, `2kh0hlwq` |
 | `/nix/store/2798izy25ppzci92q88ff8spvrgad8rx-mpfr-4.2.2-info` | **3** | `s6w6ji55`, `y6389270`, `5fmqqppa` |
 | `/nix/store/n2ihhd84xqakpwi8mgpp0jigln4mhrbn-mpfr-4.2.2-doc` | **3** | `3m1319j9`, `m987c7y9`, `fiqrdsdy` |
-| `/nix/store/x8zr8fz0n8g2pnq508xmbncgdviwya0l-expand-response-params` | **2** | `gk36k5fd`, `bzkq151p` *(compiled C binary deduplicated across stages!)* |
+| `/nix/store/x8zr8fz0n8g2pnq508xmbncgdviwya0l-expand-response-params` | **2** | `gk36k5fd`, `bzkq151p` *(compiled C binary deduplicated across stages)* |
 | `/nix/store/cr6hr5ds4lbx3y79x6ani29a4p18aqwv-bash-5.3p3-debug` | **2** | `2hg82qsg`, `i7p4sb8d` |
 | `/nix/store/0f44wkcgrkzh6520xhyy5l65nddbrc5c-binutils-2.44-man` | **2** | `2b43ga3y`, `5951bdp9` |
 | `/nix/store/1g21g21qal66isv16by0d25a0ziqzzrd-binutils-2.44-info` | **2** | `b4b5lfds`, `ynws37nl` |
 | `/nix/store/bg1j2ibpmnl2j0r593lib5vh2zhz7iyw-binutils-wrapper-2.44-man` | **2** | `641ksb94`, `iwh74pj4` |
 | `/nix/store/qlc6cqhhcbczxgr6p5i23mhws9b77ayl-binutils-wrapper-2.44-info` | **2** | `0s7vn1v9`, `fmf1v6h8` |
 | `/nix/store/bmh08hmsvy5sddbi9fjnviixwll5dxxs-python-setup-hook.sh` | **2** | `4441jg4a`, `1ay695zg` |
-| `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-6.3.0-info` | **2** | `3g3f04ja`, `a945qkvw` *(shares hash `j1zgcfidm58ay0zxcc724ciwxv6mwn91` with `gmp-with-cxx`!)* |
+| `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-6.3.0-info` | **2** | `3g3f04ja`, `a945qkvw` *(shares hash `j1zgcfidm58ay0zxcc724ciwxv6mwn91` with `gmp-with-cxx`)* |
 | `/nix/store/j1zgcfidm58ay0zxcc724ciwxv6mwn91-gmp-with-cxx-6.3.0-info` | **2** | `8arwbp01`, `jw6fiway` |
 | `/nix/store/n0ab0gfyylp1rfn0hi0l6x8zjnmm89j2-xz-5.8.3-doc` | **2** | `x4qgpmhz`, `h4ch4ldb` |
 | `/nix/store/pccswiggmljfpbsb57kjg50amd348s2s-xz-5.8.3-man` | **2** | `yzci0g7r`, `34qc1s1k` |
