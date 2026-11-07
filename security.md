@@ -143,4 +143,6 @@ To enforce **Invariant 3** in practice without adding format-specific logic to N
         - If absent, stream the NAR through the built-in format-agnostic C++ `relocateNAR` with `blindSelf = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-<out-name>"`.
      2. Compute the SHA-256 digest $H_{\text{blind}}$ of the resulting blinded NAR stream.
      3. Compute `recomputedPath = makeContentAddressedOutputPath(H_blind, outName)` and assert `recomputedPath == "/nix/store/<out-hash>-<out-name>"`.
-   - **Simultaneous Invertibility Check**: Because build-time Pass 1 blinded `<input-hash>-<out-name>` $\to$ `<relocator-hash>-<out-name>` and Pass 2 relocated `<relocator-hash>-<out-name>` $\to$ `<out-hash>-<out-name>`, whereas `nix hash casper` relocates `<out-hash>-<out-name>` back to `<relocator-hash>-<out-name>`, a matching hash proves that Pass 2 is a lossless inverse on the output's self-references.
+   - **Build-Time Pass 3 Fixed-Point Check & Offline Verification**:
+     - During build, [`DerivationBuilderImpl::registerOutputs`](nix/src/libstore/build/derivation-builder-impl.cc#L770-L796) immediately executes **Pass 3** on the unpacked output (`<out-hash>-<out-name>` $\to$ `blindSelf`) and asserts `pass3Nar.hash == normalizedNar.hash`, rejecting the build (`OutputRejected`) if Pass 2 was not a lossless inverse of Pass 1 or if the output hash is not a true fixed point.
+     - Offline or after substitution from a binary cache, `nix hash casper` / `nix-hash --casper` repeats this exact Pass 3 check on `/nix/store/<out-hash>-<out-name>` directly.

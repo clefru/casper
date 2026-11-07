@@ -56,6 +56,8 @@ One way to sidestep the self-reference loop without rewriting package contents i
      - Because self-references were blinded in the NAR stream first (even inside `.gz` entries), two builds with different input hashes that produce the same content yield the **exact same `<output-hash>`** without writing a blinded copy to disk.
    - **Step 2c (In-Stream Relocation + Trusted Outer-Layer NAR Unpacking & Reference Scan)**:
      - The outer layer pipes the NAR through `relocate.sh "<blind-hash>-<name>" "<output-hash>-<name>"` and feeds `stdout` directly into Nix's C++ `TeeSink(RestoreSink("/nix/store/<output-hash>-<name>"), HashAndRefScanSink)`—simultaneously unpacking the final output to `/nix/store/fahxx11...-foo-1.2.3`, computing its final `narHash`/`narSize`, and scanning the final uncompressed NAR stream for store references.
+   - **Step 2d / Pass 3 (Fixed-Point Verification)**:
+     - Immediately after unpacking the relocated output, Nix re-blinds the unpacked output (`relocate.sh "<output-hash>-<name>" "<blind-hash>-<name>"`) into a SHA-256 `HashSink` and asserts that the re-blinded digest equals Step 2b's `normalizedNar.hash`—proving at build time that `<output-hash>` is a true fixed point and that Pass 2 was a lossless inverse of Pass 1.
 3. **Downstream Dependency Rewriting in Builder Args & Env**:
    - When a downstream derivation `bar` (which depends on `foo`) was evaluated, its `.drv` recorded `foo`'s input-addressed path `/nix/store/abcdef...-foo-1.2.3`.
    - Before `bar` is built, Nix looks up the realised output path of `foo` (`/nix/store/fahxx11...-foo-1.2.3`) and rewrites `abcdef...` -> `fahxx11...` in `bar`'s builder arguments (`drv.args`), environment variables (`drv.env`), structured attrs / extra files, and sandbox `inputPaths`.
@@ -66,8 +68,9 @@ flowchart TD
     A["1. Builder runs in sandbox, producing $out = /nix/store/abcdef-foo-1.2.3\nOuter layer serializes $out to NAR stream (dumpPath)"] --> B["2. Pass 1 (NAR -> NAR on stdin/stdout):\nrelocate.sh abcdef-foo-1.2.3 <blind>-foo-1.2.3 < in.nar\nPipe stdout directly into C++ SHA-256 HashSink -> compressHash = fahxx11"]
     B --> C["3. Pass 2 (NAR -> NAR on stdin/stdout):\nrelocate.sh <blind>-foo-1.2.3 fahxx11-foo-1.2.3 < blind.nar"]
     C --> D["4. Outer layer (nix-daemon) unpacks stdout NAR to /nix/store/fahxx11-foo-1.2.3\nwhile simultaneously computing final narHash & scanning references"]
-    D --> E["5. Record mapping abcdef-foo-1.2.3 -> fahxx11-foo-1.2.3 in SQLite DB"]
-    E --> F["6. Downstream build (bar):\nRewrite abcdef -> fahxx11 in bar's builder args, env & sandbox inputs"]
+    D --> G["5. Pass 3 (Fixed-Point Verification):\nRe-blind fahxx11-foo-1.2.3 -> <blind>-foo-1.2.3 and assert SHA-256 == Pass 1 hash"]
+    G --> E["6. Record mapping abcdef-foo-1.2.3 -> fahxx11-foo-1.2.3 in SQLite DB"]
+    E --> F["7. Downstream build (bar):\nRewrite abcdef -> fahxx11 in bar's builder args, env & sandbox inputs"]
 ```
 
 ### 2.2 `relocate.sh` as a `NAR` $\to$ `NAR` Stream Transformer (`stdin` $\to$ `stdout`)
@@ -140,7 +143,7 @@ Because we do not keep symlinks at `/nix/store/<inputHash>-<name>`, downstream d
    - Format-specific relocation (such as `.gz` decompression, rewriting, and deterministic `gzip -n` recompression) is delegated entirely to `$out/nix-support/relocate.sh`.
    - When a derivation provides `$out/nix-support/relocate.sh` (which must be a symlink to a standalone relocator derivation in `/nix/store/<relocator-hash>-<relocator-name>/...`), `registerOutputs` extracts `<relocator-hash>` from the symlink target and uses `<relocator-hash>-<out-name>` as the dynamic blinding target (`blindSelf`) so the relocator cannot predict or branch on the blinding hash. `runRelocateScript` executes `relocate.sh <oldSelf> <newSelf>` directly via `execve` inside the isolated sandbox namespaces (`CLONE_NEWUSER`, `CLONE_NEWNS`, `CLONE_NEWNET`, `CLONE_NEWIPC`, `CLONE_NEWUTS`, seccomp/Landlock, `closeExtraFDs`), piping the input NAR over `stdin` and reading the relocated NAR from `stdout`.
    - Added `nix hash casper` / `nix-hash --casper` in [`src/nix/hash.cc`](nix/src/nix/hash.cc) to recompute and verify the content-addressed store hash of any `/nix/store/<out-hash>-<out-name>` by extracting `<relocator-hash>` from `$out/nix-support/relocate.sh`, blinding `<out-hash>-<out-name>` $\to$ `<relocator-hash>-<out-name>`, hashing the blinded NAR stream with SHA-256, and checking that the derived `casper:out` store path matches `/nix/store/<out-hash>-<out-name>`.
-   - In `DerivationBuilderImpl::registerOutputs()`, performs Pass 1 (`$out` $\to$ blinded NAR $\to$ `HashSink(SHA256)` with zero disk writes) and Pass 2 (blinded NAR $\to$ final NAR $\to$ `TeeSink(restorePath, finalNarHashSink, PathRefScanSink)`), verifies `narHash` on pre-existing `caOutPath` hits, and records the `PathRewrites` mapping in `LocalStore`.
+   - In `DerivationBuilderImpl::registerOutputs()`, performs Pass 1 (`$out` $\to$ blinded NAR $\to$ `HashSink(SHA256)` with zero disk writes), Pass 2 (blinded NAR $\to$ final NAR $\to$ `TeeSink(restorePath, finalNarHashSink, PathRefScanSink)`), and Pass 3 (re-blinds unpacked `newSelf` $\to$ `blindSelf` and verifies the fixed-point hash `pass3Nar.hash == normalizedNar.hash`), verifies `narHash` on pre-existing `caOutPath` hits, and records the `PathRewrites` mapping in `LocalStore`.
    - Updated `checkOutputs()` in `derivation-check.cc` to resolve `allowedReferences`, `allowedRequisites`, `disallowedReferences`, and `disallowedRequisites` through `store.resolveInputPath` and current derivation outputs.
 
 ---
