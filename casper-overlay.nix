@@ -35,9 +35,9 @@ let
   };
 
   extendRefChecks =
-    old:
+    relocatorDrv: old:
     let
-      addRelocator = list: if list == null then null else list ++ [ casper-relocate ];
+      addRelocator = list: if list == null then null else list ++ [ relocatorDrv ];
       patchCheckAttr =
         chk:
         chk
@@ -59,9 +59,9 @@ let
     };
 
   /* Low-level helper that attaches a symlink
-     `$output/nix-support/relocate.sh -> ${casper-relocate}/bin/casper-relocate`
-     (or a custom NAR -> NAR script when `relocateStream` / `relocateExtra` is specified)
-     and updates `allowedReferences` / `allowedRequisites` in the overlay. */
+     `$output/nix-support/relocate.sh -> ${relocatorDrv}/bin/casper-relocate`
+     (always a symlink to a standalone derivation so its store-path hash serves
+     as the cryptographic blinding target) and updates `allowedReferences` / `allowedRequisites`. */
   withCasper =
     {
       relocateExtra ? "",
@@ -70,26 +70,15 @@ let
     pkg:
     let
       isDefaultSymlink = relocateStream == "" && relocateExtra == "";
-      hookScript =
-        if isDefaultSymlink then
+      customRelocator = prev.stdenv.mkDerivation {
+        name = "casper-relocate-${pkg.pname or pkg.name or "custom"}";
+        dontUnpack = true;
+        buildPhase =
           ''
-            for _casper_out in ''${outputs:-out}; do
-              eval "_casper_dir=\$$_casper_out"
-              if [ -n "$_casper_dir" ] && [ -d "$_casper_dir" ] && [ ! -e "$_casper_dir/nix-support/relocate.sh" ]; then
-                if [ -n "$(find "$_casper_dir" -type f -name '*.gz' -print -quit 2>/dev/null)" ]; then
-                  mkdir -p "$_casper_dir/nix-support"
-                  ln -s ${casper-relocate}/bin/casper-relocate "$_casper_dir/nix-support/relocate.sh"
-                fi
-              fi
-            done
-          ''
-        else
-          ''
-            if [ -d "$out" ]; then
-              mkdir -p "$out/nix-support"
+            mkdir -p "$out/bin"
           ''
           + prev.lib.optionalString (relocateStream != "") ''
-              cat << 'CASPER_RELOCATE_EOF' > "$out/nix-support/relocate.sh"
+            cat << 'CASPER_RELOCATE_EOF' > "$out/bin/casper-relocate"
             #!/bin/sh
             export LC_ALL=C
             set -e
@@ -101,10 +90,10 @@ let
             fi
             ${relocateStream}
             CASPER_RELOCATE_EOF
-              chmod +x "$out/nix-support/relocate.sh"
+            chmod +x "$out/bin/casper-relocate"
           ''
           + prev.lib.optionalString (relocateStream == "" && relocateExtra != "") ''
-              cat << 'CASPER_RELOCATE_EOF' > "$out/nix-support/relocate.sh"
+            cat << 'CASPER_RELOCATE_EOF' > "$out/bin/casper-relocate"
             #!/bin/sh
             export LC_ALL=C
             set -e
@@ -158,17 +147,45 @@ let
 
             nix-store --dump "$target"
             CASPER_RELOCATE_EOF
-              chmod +x "$out/nix-support/relocate.sh"
-            fi
+            chmod +x "$out/bin/casper-relocate"
+          '';
+        dontInstall = true;
+        dontFixup = true;
+      };
+
+      relocatorDrv = if isDefaultSymlink then casper-relocate else customRelocator;
+
+      hookScript =
+        if isDefaultSymlink then
+          ''
+            for _casper_out in ''${outputs:-out}; do
+              eval "_casper_dir=\$$_casper_out"
+              if [ -n "$_casper_dir" ] && [ -d "$_casper_dir" ] && [ ! -e "$_casper_dir/nix-support/relocate.sh" ]; then
+                if [ -n "$(find "$_casper_dir" -type f -name '*.gz' -print -quit 2>/dev/null)" ]; then
+                  mkdir -p "$_casper_dir/nix-support"
+                  ln -s ${casper-relocate}/bin/casper-relocate "$_casper_dir/nix-support/relocate.sh"
+                fi
+              fi
+            done
+          ''
+        else
+          ''
+            for _casper_out in ''${outputs:-out}; do
+              eval "_casper_dir=\$$_casper_out"
+              if [ -n "$_casper_dir" ] && [ -d "$_casper_dir" ] && [ ! -e "$_casper_dir/nix-support/relocate.sh" ]; then
+                mkdir -p "$_casper_dir/nix-support"
+                ln -s ${customRelocator}/bin/casper-relocate "$_casper_dir/nix-support/relocate.sh"
+              fi
+            done
           '';
 
       transformAttrs =
         old:
         {
-          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ casper-relocate ];
+          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ relocatorDrv ];
           postFixup = (old.postFixup or "") + "\n" + hookScript;
         }
-        // extendRefChecks old;
+        // extendRefChecks relocatorDrv old;
     in
     if pkg ? overrideAttrs then
       pkg.overrideAttrs transformAttrs

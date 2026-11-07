@@ -113,3 +113,34 @@ Ideally, `relocate.sh` ($R(T, \text{old}, \text{new})$) would behave as a pure, 
    - **Crucial Constraint—Keep C++ Format-Agnostic**: Nix must **not** need to load, parse, or rewrite files in C++ after calling `relocate.sh`. The entire reason `relocate.sh` exists is so that format-specific logic (`.gz`, `.xz`, `.zst`, Python `RECORD`, etc.) stays inside `relocate.sh` and out of Nix's C++ codebase; C++ should only invoke `relocate.sh` and compute standard tree `NARHash`es.
 3. **Post-Relocation Reference Conservation (Invariant 5)**:
    - Re-running `scanForReferences` on the final output tree *after* `relocate.sh` finishes (or simultaneously while unpacking the output NAR from `relocate.sh`'s `stdout`) and verifying that the reference set matches the pre-relocation reference set (modulo `<inputHash>` $\to$ `<outHash>`) is completely format-agnostic in C++ and prevents `relocate.sh` from smuggling undeclared or disallowed `/nix/store/...` references after hashing.
+
+---
+
+## 5. Dynamic Blinding Target via Symlinked Relocator Store Hash & Round-Trip Self-Verification
+
+To enforce **Invariant 3** in practice without adding format-specific logic to Nix C++, CASPER uses the **store-path hash of the symlinked relocator derivation itself** as the blinding target (`blindSelf`):
+
+1. **Mandatory Symlink to a Standalone Relocator Derivation**:
+   - Derivations are prohibited from embedding an inline script at `$out/nix-support/relocate.sh`.
+   - Whenever `$out/nix-support/relocate.sh` is present, [`DerivationBuilderImpl::registerOutputs`](nix/src/libstore/build/derivation-builder-impl.cc#L636-L675) verifies via `lstat` and `store->toStorePath(readLink(...))` that `$out/nix-support/relocate.sh` is a **symbolic link pointing to a valid store path**:
+     $$\texttt{\$out/nix-support/relocate.sh} \longrightarrow \texttt{/nix/store/}\langle\text{relocator-hash}\rangle\texttt{-}\langle\text{relocator-name}\rangle\texttt{/bin/casper-relocate}$$
+   - Any custom relocator must therefore be built as its own derivation first and referenced via a symlink.
+
+2. **Unsolvable Cryptographic Hash Loop for a Dishonest Relocator**:
+   - Instead of blinding `<input-hash>-<out-name>` to a fixed constant (`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-<out-name>`), Nix extracts the 32-character Nix32 `<relocator-hash>` from the `relocate.sh` symlink target and sets:
+     $$\texttt{blindSelf} = \langle\text{relocator-hash}\rangle\texttt{-}\langle\text{out-name}\rangle$$
+   - **Why the relocator cannot know `blindSelf`**:
+     - `<relocator-hash>` is derived from the cryptographic SHA-256 hash of the relocator derivation's own output (`makeContentAddressedOutputPath(narHash, relocatorName)`).
+     - For the relocator executable or script to hardcode `<relocator-hash>` inside its own code (for example, to detect `if ($2 == "<relocator-hash>-...")` and behave differently during Pass 1 blinding vs. Pass 2 relocation), the relocator would have to embed its own SHA-256 output hash inside itself before being hashed—an **unsolvable cryptographic preimage / fixed-point loop**.
+   - **Why `blindSelf` never collides with the `relocate.sh` symlink target**:
+     - The `relocate.sh` symlink target is `/nix/store/<relocator-hash>-<relocator-name>/...`, whereas `blindSelf` is `<relocator-hash>-<out-name>`.
+     - Nix enforces `!hasPrefix(<relocator-name>, <out-name>)` (and `casper-overlay.nix` prefixes relocator derivations with `casper-relocate-...`), so `<relocator-hash>-<out-name>` is never equal to or a prefix of `<relocator-hash>-<relocator-name>`, ensuring Pass 2 (`<relocator-hash>-<out-name>` $\to$ `<out-hash>-<out-name>`) never rewrites the `relocate.sh` symlink target itself.
+
+3. **Zero-Knowledge Post-Build & Binary-Cache Self-Verification (`nix hash casper` / `nix-hash --casper`)**:
+   - Because `<relocator-hash>` is preserved directly in the symlink target of `$out/nix-support/relocate.sh` inside the final store object `/nix/store/<out-hash>-<out-name>`, any party can independently recompute and verify `<out-hash>` from `/nix/store/<out-hash>-<out-name>` alone—without needing the `.drv`, the original evaluation `<input-hash>`, or the SQLite `PathRewrites` table:
+     1. Inspect `/nix/store/<out-hash>-<out-name>/nix-support/relocate.sh`:
+        - If present, verify it is a symlink, parse its target store path `/nix/store/<relocator-hash>-<relocator-name>/...`, set `blindSelf = "<relocator-hash>-<out-name>"`, and pipe the NAR of `/nix/store/<out-hash>-<out-name>` through `relocate.sh "<out-hash>-<out-name>" "<relocator-hash>-<out-name>"`.
+        - If absent, stream the NAR through the built-in format-agnostic C++ `relocateNAR` with `blindSelf = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-<out-name>"`.
+     2. Compute the SHA-256 digest $H_{\text{blind}}$ of the resulting blinded NAR stream.
+     3. Compute `recomputedPath = makeContentAddressedOutputPath(H_blind, outName)` and assert `recomputedPath == "/nix/store/<out-hash>-<out-name>"`.
+   - **Simultaneous Invertibility Check**: Because build-time Pass 1 blinded `<input-hash>-<out-name>` $\to$ `<relocator-hash>-<out-name>` and Pass 2 relocated `<relocator-hash>-<out-name>` $\to$ `<out-hash>-<out-name>`, whereas `nix hash casper` relocates `<out-hash>-<out-name>` back to `<relocator-hash>-<out-name>`, a matching hash proves that Pass 2 is a lossless inverse on the output's self-references.
