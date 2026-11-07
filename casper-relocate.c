@@ -165,11 +165,12 @@ static void expect_tag(const char *expected) {
 
 static uint8_t *replace_all(const uint8_t *in, size_t in_len, size_t *out_len) {
     if (g_old_len == 0 || in_len < g_old_len) {
-        uint8_t *copy = (uint8_t *)malloc(in_len ? in_len : 1);
+        uint8_t *copy = (uint8_t *)malloc(in_len + 1);
         if (!copy)
             die("casper-relocate: out of memory");
         if (in_len > 0)
             memcpy(copy, in, in_len);
+        copy[in_len] = '\0';
         *out_len = in_len;
         return copy;
     }
