@@ -34,6 +34,10 @@
 - When a dependency `foo` is relocated from `/nix/store/<input-hash>-foo` to `/nix/store/<output-hash>-foo`, Nix records the mapping in SQLite (`PathRewrites` and `DerivationOutputs`).
 - Before building any downstream derivation `bar`, Nix rewrites `<input-hash>-foo` $\to$ `<output-hash>-foo` across `bar`'s builder arguments, environment variables, structured attributes, and sandbox inputs so `bar` builds directly against `/nix/store/<output-hash>-foo`.
 
+### 1.6 Replacing Dependencies on the Fly (CPU Optimization & Rapid Security Patching)
+- Because `relocate.sh` is a general `<old-hash>-<name>` $\to$ `<new-hash>-<name>` `NAR` $\to$ `NAR` stream transformer, it can rewrite **dependency hashes** in addition to self-references (similar in spirit to Nixpkgs' `replaceDependencies`, but format-aware and content-addressed).
+- This enables both **rapid security updates deep in the stack** (swapping a CVE-patched `openssl`, `glibc`, or `zlib` across a built system in seconds without recompiling reverse dependencies) and **targeted CPU optimization** (swapping in a `-march=native` `glibc` or `openblas`), producing new content-addressed store paths that pass `nix-hash --casper` (see [docs/DEP_REPLACE.md](docs/DEP_REPLACE.md)).
+
 ---
 
 ## 2. Quickstart & How to Use CASPER
@@ -148,6 +152,8 @@ One way to sidestep the self-reference loop without rewriting package contents i
 ## 4. Documentation
 
 - **[Detailed Architecture (`docs/DETAILS.md`)](docs/DETAILS.md)**: End-to-end operational pipeline, Mermaid flowchart, `NAR` $\to$ `NAR` stream protocol, and multi-output/downstream dependency rewriting.
+- **[On-the-Fly Dependency Replacement (`docs/DEP_REPLACE.md`)](docs/DEP_REPLACE.md)**: Using `relocate.sh` to swap ABI-compatible dependencies (such as a CPU-optimized `glibc`) across built packages without recompiling.
+- **[Binary Caching & Build Non-Determinism (`docs/NON_DETERMINISM.md`)](docs/NON_DETERMINISM.md)**: `input -> output` realisation index for binary caches, build non-determinism trade-offs, and symlink strategies (`input_hash -> output_hash` vs. `competing_output_hash -> master_output_hash`) to prevent diamond dependency duplication.
 - **[Nixpkgs Bootstrapping & Packaging Guide (`docs/BOOTSTRAPPING_AND_PACKAGING.md`)](docs/BOOTSTRAPPING_AND_PACKAGING.md)**: Packaging trade-offs for opaque formats, the dual-location rebuild trick, [`casper-overlay.nix`](casper-overlay.nix) internals, and full `stage0-posix` / `stdenv` bootstrap tables.
 - **[Nix C++ Implementation Overview (`docs/NIX_IMPLEMENTATION.md`)](docs/NIX_IMPLEMENTATION.md)**: Summary of modified C++ files in the [`nix/`](nix) submodule.
 - **[Security Considerations & Threat Model (`docs/SECURITY.md`)](docs/SECURITY.md)**: Sandbox threat model, prototype vulnerabilities, dynamic `<relocator-hash>` blinding construction, and Pass 3 fixed-point verification.

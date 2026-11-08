@@ -14,25 +14,32 @@ final: prev:
 let
   bootPkgs = prev.stdenv.__bootPackages or prev;
 
-  casper-relocate = prev.stdenv.mkDerivation {
-    pname = "casper-relocate";
-    version = "1.0.0";
-    dontUnpack = true;
-    buildInputs = [
-      prev.stdenv.cc.libc.static
-      bootPkgs.zlib.dev
-      bootPkgs.zlib.static
-    ];
-    allowedReferences = [ ];
-    buildPhase = ''
-      mkdir -p "$out/bin"
-      $CC -O2 -Wall -Wextra -static ${./casper-relocate.c} -lz -o "$out/bin/casper-relocate"
-      strip -s "$out/bin/casper-relocate"
-      sed -i 's|/nix/store/[0-9a-df-np-sv-z]\{32\}-|/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-|g' "$out/bin/casper-relocate"
-    '';
-    dontInstall = true;
-    dontFixup = true;
-  };
+  casper-relocate =
+    if
+      (prev.stdenv.hostPlatform != prev.stdenv.buildPlatform || prev.stdenv.hostPlatform.isStatic)
+      && (prev.buildPackages ? casper-relocate)
+    then
+      prev.buildPackages.casper-relocate
+    else
+      prev.stdenv.mkDerivation {
+        pname = "casper-relocate";
+        version = "1.0.0";
+        dontUnpack = true;
+        buildInputs = [
+          (prev.stdenv.cc.libc.static or prev.stdenv.cc.libc)
+          (bootPkgs.zlib.dev or bootPkgs.zlib)
+          (bootPkgs.zlib.static or bootPkgs.zlib)
+        ];
+        allowedReferences = [ ];
+        buildPhase = ''
+          mkdir -p "$out/bin"
+          $CC -O2 -Wall -Wextra -static ${./casper-relocate.c} -lz -o "$out/bin/casper-relocate"
+          strip -s "$out/bin/casper-relocate"
+          sed -i 's|/nix/store/[0-9a-df-np-sv-z]\{32\}-|/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-|g' "$out/bin/casper-relocate"
+        '';
+        dontInstall = true;
+        dontFixup = true;
+      };
 
   extendRefChecks =
     relocatorDrv: old:
@@ -181,9 +188,15 @@ let
 
       transformAttrs =
         old:
+        let
+          oldNativeBuildInputs =
+            if (old.nativeBuildInputs or null) == null then [ ] else old.nativeBuildInputs;
+          oldPostFixup =
+            if (old.postFixup or null) == null then "" else old.postFixup;
+        in
         {
-          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ relocatorDrv ];
-          postFixup = (old.postFixup or "") + "\n" + hookScript;
+          nativeBuildInputs = oldNativeBuildInputs ++ [ relocatorDrv ];
+          postFixup = oldPostFixup + "\n" + hookScript;
         }
         // extendRefChecks relocatorDrv old;
     in
@@ -227,6 +240,13 @@ let
 in
 {
   inherit casper-relocate;
+
+  # In rootless user-namespace sandboxes, unmapped supplementary host GIDs appear in
+  # getgroups() as overflowgid (65534), causing rsync's chgrp test to try `chgrp 65534`
+  # and fail with EINVAL.
+  rsync = prev.rsync.overrideAttrs (_: {
+    doCheck = false;
+  });
 
   stdenv =
     if prev.lib.hasPrefix "bootstrap-" prev.stdenv.name then
