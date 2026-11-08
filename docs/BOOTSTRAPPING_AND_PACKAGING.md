@@ -199,3 +199,24 @@ Querying `PathRewrites` in `casper-store/nix/var/nix/db/db.sqlite` showed **20 o
      1. `rzkzgcpi35061aphd7nvw9q4567ws09d-file-5.45-man`: `share/man/man1/file.1.gz`, `share/man/man3/libmagic.3.gz`, and `share/man/man4/magic.4.gz` (rewrote `/nix/store/018l43lbsqbrsasrfdcxxb5s4s161fkr-file-5.45/share/misc/magic*` $\to$ `/nix/store/40xf2hs1hr0934ad6a5w1kb6krc16g7a-file-5.45/share/misc/magic*`).
      2. `vbrchwv2wc4s32cdnf6ns12b751b5v3f-gettext-0.25.1-man` (Stage 3): `share/man/man1/gettext.1.gz` and `share/man/man1/ngettext.1.gz` (rewrote `/nix/store/qawh4dvis37x3nvvsd1n53v13gy9yq9g-gettext-0.25.1/share/locale` $\to$ `/nix/store/mj7f7qmykivmz7cmwq62gn0zd5w173is-gettext-0.25.1/share/locale`).
      3. `8gjj4hnbj7fr4bfyd2yp5bfvbx5lh7d7-gettext-0.25.1-man` (Stage 4): `share/man/man1/gettext.1.gz` and `share/man/man1/ngettext.1.gz` (rewrote `/nix/store/yfnzmmv8r4wzgg2f0fci4xl874lm7w5x-gettext-0.25.1/share/locale` $\to$ `/nix/store/6jz09pa69k6nfijv6ij5laf6k4m8qh2z-gettext-0.25.1/share/locale`).
+
+---
+
+## 5. Full NixOS 25.11 GNOME 49 Wayland Desktop (`pkgs.nixosTests.gnome`)
+
+Building `pkgs.nixosTests.gnome` from NixOS 25.11 on top of the bootstrapped `casper-store` compiled and verified **2,717 derivations** (**5,213 relocated outputs**, deduplicated into **5,077 unique content-addressed store paths**) and booted the resulting NixOS system inside QEMU into a full GNOME 49 Wayland desktop session (`gdm-49.2` $\to$ `gnome-shell-49.4` $\to$ `org.gnome.Console`):
+
+| Component | Evaluation Input Path (`<inputHash>-<name>`) | Relocated Content-Addressed Path (`<outHash>-<name>`) |
+| :--- | :--- | :--- |
+| **`llvm-21.1.7`** | `/nix/store/1nh1d0r41cvjzm2rrsfn4v3738sgdzk1-llvm-21.1.7` | `/nix/store/q0jlx0ncwd38rk2a66mh5rfyxw1f51xk-llvm-21.1.7` |
+| **`rustc-1.91.1`** | `/nix/store/smayjzjmy57p88layrir2j0df9p19d0r-rustc-1.91.1` | `/nix/store/a52dy2qn8pvs5dm7axcswq85d0v74ywa-rustc-1.91.1` |
+| **`linux-6.12.90`** | `/nix/store/zvzfn5r5s9jzgkphzjxlxnwvz9bycg55-linux-6.12.90` | `/nix/store/dlwx8klwxbr6ikh2ry4asb3y6spz2pij-linux-6.12.90` |
+| **`initrd-linux-6.12.90`** | `/nix/store/4jg0xdlivm6mfysaa07in3zm3hnxp5dl-initrd-linux-6.12.90` | `/nix/store/0aq16d0krb14hl3ynhkmlrd251vw5759-initrd-linux-6.12.90` |
+| **`mesa-25.2.6`** | `/nix/store/qff7aiydyci9rfwl74giqgdyqg3ly0fn-mesa-25.2.6` | `/nix/store/nkqqsswfx5idyi6zsws5d09mm7gbjhhg-mesa-25.2.6` |
+| **`gtk4-4.20.3`** | `/nix/store/m20v0xzsfp5v6s5djs05amh99kgikkx0-gtk4-4.20.3` | `/nix/store/7x82lp54dyfc97xpp6yjkknj1mjzjcg7-gtk4-4.20.3` |
+| **`webkitgtk-2.52.3+abi=6.0`** | `/nix/store/wgf1fd8rb04p70gf7rv1s2ir9i5fl6mf-webkitgtk-2.52.3+abi=6.0` | `/nix/store/zvrv66nwzp7n5c4yafjg52dh95r7h8hn-webkitgtk-2.52.3+abi=6.0` |
+| **`mutter-49.4`** | `/nix/store/7x5x8216y69flsfryzsbs9s7ywhpm3dg-mutter-49.4` | `/nix/store/m8apa1zh0j808my91a3lzajd2vw067vw-mutter-49.4` |
+| **`gdm-49.2`** | `/nix/store/43v4nk5bg1214r8wa9nnrp6k40wpcpha-gdm-49.2` | `/nix/store/6xjk8zx3jf5jg85ch965219x45nam5dm-gdm-49.2` |
+| **`gnome-shell-49.4`** | `/nix/store/iq6ammhk11wnyh1yrszl014iwwnbpipl-gnome-shell-49.4` | `/nix/store/q1v2v4vl5rn2jzgramdlyhk4pg1ldkjv-gnome-shell-49.4` |
+| **`nixos-system-machine-test`** | `/nix/store/r2f1rzw1w4y8n0hpbp4p97sckzxyxpkf-nixos-system-machine-test` | `/nix/store/73j7lkqy0diqwvq6jq7xl8waqxx2phpn-nixos-system-machine-test` |
+| **`nixos-test-driver-gnome`** | `/nix/store/yvnxkflc0kpzshxjr60k4ggjgyq7dmmq-nixos-test-driver-gnome` | `/nix/store/6d3sc56rp9xl6ag2c5d3c5fbwswazvhh-nixos-test-driver-gnome` |

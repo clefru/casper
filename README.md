@@ -1,6 +1,6 @@
 # CASPER: Content-Addressable Store via Partial-blinding and Embedded Relocation
 
-**CASPER** brings output-addressed (content-addressed) builds to Nix without `/nix/store` symlink stubs and without hardcoding file-format knowledge into Nix C++.
+**CASPER** brings output-addressed (content-addressed) builds to Nix without `/nix/store` symlink stubs and without hardcoding file-format knowledge into Nix C++. Using [`casper-overlay.nix`](casper-overlay.nix), CASPER builds and runs everything from the `stage0-posix` (`hex0`) bootstrap seed up to a complete **NixOS 25.11 GNOME 49 Wayland desktop** (`pkgs.nixosTests.gnome`: **2,717 derivations** / **5,213 relocated outputs** / **5,077 unique content-addressed store paths**).
 
 ---
 
@@ -77,6 +77,15 @@ The resulting binaries (`nix`, `nix-build`, `nix-store`, `nix-hash`, etc.) are p
 ```
 
 Running [`bootstrap.sh`](bootstrap.sh) builds both `minimal-bootstrap.kaem` (49 derivations from `hex0`) and the full Nixpkgs `stdenv` (`stage0` $\to$ `stage4` $\to$ `stdenv` $\to$ `hello`, 264 derivations) into `./casper-store`, relocating **313 derivation outputs** and automatically deduplicating **20 cross-stage output groups** into **274 unique content-addressed store paths** (see [docs/BOOTSTRAPPING_AND_PACKAGING.md](docs/BOOTSTRAPPING_AND_PACKAGING.md#4-real-world-bootstrap-verification-casper-store)).
+
+#### Run a Full NixOS 25.11 GNOME 49 Wayland Desktop (`pkgs.nixosTests.gnome`)
+
+Beyond bootstrapping `stdenv`, CASPER builds and runs a complete **NixOS 25.11 GNOME 49 Wayland desktop** (`pkgs.nixosTests.gnome`) in `./casper-store`:
+
+- **2,717 derivations** (**5,213 relocated outputs**, deduplicated into **5,077 unique content-addressed store paths** with zero `/nix/store` symlink stubs), spanning `linux-6.12.90`, `systemd`, `llvm-21.1.7`, `rustc-1.91.1`, `mesa-25.2.6`, `wayland`, `gtk4-4.20.3`, `webkitgtk-2.52.3` (`abi=4.1` and `abi=6.0`), `mutter-49.4`, `gnome-shell-49.4`, `gdm-49.2`, `gnome-control-center-49.5`, and `qemu-10.1.5`.
+- Every package output passed Pass 1 partial blinding, `casper:out` SHA-256 content addressing, Pass 2 `NAR` $\to$ `NAR` stream relocation, and Pass 3 fixed-point idempotency verification, and the resulting NixOS VM booted into GDM, auto-logged into the GNOME 49 Wayland session, and launched `org.gnome.Console`:
+
+![NixOS 25.11 GNOME 49 Wayland Desktop Running on CASPER](docs/gnome-screen.png)
 
 ---
 
