@@ -165,8 +165,17 @@ let
       hookScript =
         if isDefaultSymlink then
           ''
-            for _casper_out in ''${outputs:-out}; do
-              eval "_casper_dir=\$$_casper_out"
+            if [ -n "''${__structuredAttrs:-}" ]; then
+              _casper_outputs="''${!outputs[*]}"
+            else
+              _casper_outputs="''${outputs:-out}"
+            fi
+            for _casper_out in $_casper_outputs; do
+              if [ -n "''${__structuredAttrs:-}" ]; then
+                _casper_dir="''${outputs[$_casper_out]}"
+              else
+                eval "_casper_dir=\''${$_casper_out:-}"
+              fi
               if [ -n "$_casper_dir" ] && [ -d "$_casper_dir" ] && [ ! -e "$_casper_dir/nix-support/relocate.sh" ]; then
                 if [ -n "$(find "$_casper_dir" -type f -name '*.gz' -print -quit 2>/dev/null)" ]; then
                   mkdir -p "$_casper_dir/nix-support"
@@ -177,8 +186,17 @@ let
           ''
         else
           ''
-            for _casper_out in ''${outputs:-out}; do
-              eval "_casper_dir=\$$_casper_out"
+            if [ -n "''${__structuredAttrs:-}" ]; then
+              _casper_outputs="''${!outputs[*]}"
+            else
+              _casper_outputs="''${outputs:-out}"
+            fi
+            for _casper_out in $_casper_outputs; do
+              if [ -n "''${__structuredAttrs:-}" ]; then
+                _casper_dir="''${outputs[$_casper_out]}"
+              else
+                eval "_casper_dir=\''${$_casper_out:-}"
+              fi
               if [ -n "$_casper_dir" ] && [ -d "$_casper_dir" ] && [ ! -e "$_casper_dir/nix-support/relocate.sh" ]; then
                 mkdir -p "$_casper_dir/nix-support"
                 ln -s ${customRelocator}/bin/casper-relocate "$_casper_dir/nix-support/relocate.sh"
