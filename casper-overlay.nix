@@ -248,6 +248,13 @@ in
     doCheck = false;
   });
 
+  # IANA tzcode's `now.ck` test uses wall-clock `./date +%s` (`CHECK_NOW_TIMESTAMP`),
+  # which fails once wall-clock time passes a scheduled DST-abolition cutover (such as
+  # 2026-11-01 in tzdata-2026f). Pin `CHECK_NOW_TIMESTAMP` to the `NEWS` file's mtime.
+  tzdata = prev.tzdata.overrideAttrs (old: {
+    checkFlags = (old.checkFlags or [ ]) ++ [ "CHECK_NOW_TIMESTAMP=$$(date -r NEWS +%s)" ];
+  });
+
   stdenv =
     if prev.lib.hasPrefix "bootstrap-" prev.stdenv.name then
       prev.stdenv
@@ -260,4 +267,13 @@ in
   casper = {
     inherit casper-relocate withCasper casperRelocateSnippets;
   };
+}
+// prev.lib.optionalAttrs (prev ? vhost-device-vsock) {
+  # `test_vsock_thread_vsock_backend` requires the host kernel module `vsock_loopback`
+  # (`VMADDR_CID_LOCAL`), which may not be loaded on the build host.
+  vhost-device-vsock = prev.vhost-device-vsock.overrideAttrs (old: {
+    checkFlags = (old.checkFlags or [ ]) ++ [
+      "--skip=vhu_vsock_thread::tests::test_vsock_thread_vsock_backend"
+    ];
+  });
 }

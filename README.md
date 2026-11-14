@@ -1,6 +1,6 @@
 # CASPER: Content-Addressable Store via Partial-blinding and Embedded Relocation
 
-**CASPER** brings output-addressed (content-addressed) builds to Nix without `/nix/store` symlink stubs and without hardcoding file-format knowledge into Nix C++. Using [`casper-overlay.nix`](casper-overlay.nix), CASPER builds and runs everything from the `stage0-posix` (`hex0`) bootstrap seed up to a complete **NixOS 25.11 GNOME 49 Wayland desktop** (`pkgs.nixosTests.gnome`: **2,717 derivations** / **5,213 relocated outputs** / **5,077 unique content-addressed store paths**).
+**CASPER** brings output-addressed (content-addressed) builds to Nix without `/nix/store` symlink stubs and without hardcoding file-format knowledge into Nix C++. Using [`casper-overlay.nix`](casper-overlay.nix), CASPER builds and runs an unbroken source-based bootstrap chain from the 357-byte `stage0-posix` (`hex0`) seed (`hex0` $\to$ `mes` $\to$ `tinycc` $\to$ `gcc-4.6.4` $\to$ `gcc-10.4.0` $\to$ `gcc-16.2.0` $\to$ `glibc-2.44` $\to$ `stdenv`) all the way up to a complete **NixOS Unstable GNOME 51.0 Wayland desktop** (`pkgs.nixosTests.gnome` at `nixpkgs-unstable` [`2074cc672349`](https://github.com/NixOS/nixpkgs/commit/2074cc672349f14240fb7ea90d509e0b643e9dd4), `2026-11-12`: **3,395 relocated derivations** / **5,712 relocated outputs** / **5,551 unique content-addressed store paths**).
 
 ---
 
@@ -70,22 +70,22 @@ The resulting binaries (`nix`, `nix-build`, `nix-store`, `nix-hash`, etc.) are p
 > [!TIP]
 > **Incremental vs. Full Bootstrap**: You do not need to rebuild `stdenv` from scratch to use CASPER. Pre-existing store paths without a `PathRewrites` entry act as fixed leaves (`resolveInputPath` returns them unchanged), while newly built derivations are blinded, content-addressed, and relocated by CASPER.
 
-#### Run the Full From-Scratch Bootstrap (`stage0-posix` + `stdenv`)
+#### Run the Full From-Scratch Source Bootstrap (`stage0-posix` $\to$ `stdenv`)
 
 ```bash
-./bootstrap.sh
+NIXPKGS=/path/to/nixpkgs ./bootstrap.sh
 ```
 
-Running [`bootstrap.sh`](bootstrap.sh) builds both `minimal-bootstrap.kaem` (49 derivations from `hex0`) and the full Nixpkgs `stdenv` (`stage0` $\to$ `stage4` $\to$ `stdenv` $\to$ `hello`, 264 derivations) into `./casper-store`, relocating **313 derivation outputs** and automatically deduplicating **20 cross-stage output groups** into **274 unique content-addressed store paths** (see [docs/BOOTSTRAPPING_AND_PACKAGING.md](docs/BOOTSTRAPPING_AND_PACKAGING.md#4-real-world-bootstrap-verification-casper-store)).
+Running [`bootstrap.sh`](bootstrap.sh) against `nixpkgs-unstable` ([`2074cc672349`](https://github.com/NixOS/nixpkgs/commit/2074cc672349f14240fb7ea90d509e0b643e9dd4), `2026-11-12`) builds the entire `x86_64-linux` bootstrap chain **100% from source**—with zero prebuilt `bootstrap-tools` binary tarball—from `hex0-1.9.1` through `mes-0.27.1`, `tinycc`, `musl-1.2.6`, `gcc-4.6.4`, `gcc-10.4.0`, `glibc-2.44`, `gcc-16.2.0`, `stdenv-linux`, and `hello-2.12.3` (**480 relocated derivations** / **591 relocated outputs**), automatically deduplicating **29 cross-stage output groups** (**54 duplicate outputs eliminated**, including compiled C static libraries `crt`, `libgetopt.a`, `libc.a`, `libtcc1.a`, and `zlib-1.3.2-static`) into **537 unique content-addressed store paths** (see [docs/BOOTSTRAPPING_AND_PACKAGING.md](docs/BOOTSTRAPPING_AND_PACKAGING.md#4-real-world-bootstrap-verification-casper-store)).
 
-#### Run a Full NixOS 25.11 GNOME 49 Wayland Desktop (`pkgs.nixosTests.gnome`)
+#### Run a Full NixOS Unstable GNOME 51.0 Wayland Desktop (`pkgs.nixosTests.gnome`)
 
-Beyond bootstrapping `stdenv`, CASPER builds and runs a complete **NixOS 25.11 GNOME 49 Wayland desktop** (`pkgs.nixosTests.gnome`) in `./casper-store`:
+Beyond bootstrapping `stdenv`, CASPER builds and runs a complete **NixOS Unstable GNOME 51.0 Wayland desktop** (`pkgs.nixosTests.gnome` at `nixpkgs-unstable` [`2074cc672349`](https://github.com/NixOS/nixpkgs/commit/2074cc672349f14240fb7ea90d509e0b643e9dd4), `2026-11-12T14:50:34Z`) in `./casper-store`:
 
-- **2,717 derivations** (**5,213 relocated outputs**, deduplicated into **5,077 unique content-addressed store paths** with zero `/nix/store` symlink stubs), spanning `linux-6.12.90`, `systemd`, `llvm-21.1.7`, `rustc-1.91.1`, `mesa-25.2.6`, `wayland`, `gtk4-4.20.3`, `webkitgtk-2.52.3` (`abi=4.1` and `abi=6.0`), `mutter-49.4`, `gnome-shell-49.4`, `gdm-49.2`, `gnome-control-center-49.5`, and `qemu-10.1.5`.
-- Every package output passed Pass 1 partial blinding, `casper:out` SHA-256 content addressing, Pass 2 `NAR` $\to$ `NAR` stream relocation, and Pass 3 fixed-point idempotency verification, and the resulting NixOS VM booted into GDM, auto-logged into the GNOME 49 Wayland session, and launched `org.gnome.Console`:
+- **3,395 relocated derivations** (**5,712 relocated outputs**, deduplicated into **5,551 unique content-addressed store paths**—eliminating **161 duplicate outputs** with zero `/nix/store` symlink stubs), spanning `linux-6.18.63`, `systemd`, `llvm-22.1.8`, `rustc-1.99.1`, `python3-3.14.10`, `mesa-26.3.0`, `wayland`, `gtk4-4.24.0`, `webkitgtk-2.54.2+abi=6.0`, `mutter-51.0`, `gnome-shell-51.0`, `gdm-51.0`, `virtiofsd-1.14.0`, and `qemu-11.1.2` (as well as NixOS 25.11 GNOME 49.4 at **2,717 derivations** / **5,213 relocated outputs** $\to$ **5,077 unique content-addressed store paths**).
+- Every package output passed Pass 1 partial blinding, `casper:out` SHA-256 content addressing, Pass 2 `NAR` $\to$ `NAR` stream relocation, and Pass 3 fixed-point idempotency verification, and the resulting NixOS VM booted into GDM, auto-logged into the GNOME 51.0 Wayland session, and launched `org.gnome.Console`:
 
-![NixOS 25.11 GNOME 49 Wayland Desktop Running on CASPER](docs/gnome-screen.png)
+![NixOS Unstable GNOME 51.0 Wayland Desktop Running on CASPER](docs/gnome-screen.png)
 
 ---
 
@@ -97,12 +97,12 @@ Because `<relocator-hash>` is preserved on the `$out/nix-support/relocate.sh` sy
 # Legacy CLI:
 ./nix/build/src/nix/nix-hash --casper \
   --store "$PWD/casper-store" \
-  /nix/store/sn0pwh1agh2hnlbgm61ra3qr6yiz6ja8-hello-2.12.2
+  /nix/store/5q3rabjwwd2lanj8can9i0l2kk3yl5rp-hello-2.12.3
 
 # Modern CLI:
 ./nix/build/src/nix/nix --extra-experimental-features nix-command \
   hash casper --store "$PWD/casper-store" \
-  /nix/store/sn0pwh1agh2hnlbgm61ra3qr6yiz6ja8-hello-2.12.2
+  /nix/store/5q3rabjwwd2lanj8can9i0l2kk3yl5rp-hello-2.12.3
 ```
 
 `nix-hash --casper` locates `$out/nix-support/relocate.sh`, extracts `<relocator-hash>` from the symlink target, blinds `<output-hash>-<name>` $\to$ `<relocator-hash>-<name>`, hashes the resulting NAR stream with SHA-256, and verifies that the recomputed `casper:out` store path matches `/nix/store/<output-hash>-<name>`.

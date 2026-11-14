@@ -110,13 +110,13 @@ in {
   - `localStore.resolveInputPath(inputPath)` in [`local-store.cc`](../nix/src/libstore/local-store.cc#L1838-L1854) returns `inputPath` unchanged whenever a store path has no entry in the `PathRewrites` SQLite table.
   - Therefore, pre-existing store paths in `/nix/store` (or paths substituted from `cache.nixos.org`) act as fixed leaves, while every **newly built** derivation goes through CASPER's streaming `NAR` $\to$ `NAR` blinding, content-hashing, and relocation.
 
-### 3.2 Mode B: Full End-to-End `stdenv` Bootstrap from `bootstrap-tools`
-When bootstrapping `nixpkgs` from scratch (`stdenvStages` 0 through final `stdenv`):
-1. **Stage 0 (`bootstrap-tools`)**:
-   - Downloaded as a fixed-output derivation (`CAFixed`), unpacked by `busybox` (`unpack-bootstrap-tools.sh`), and relocated in-process by C++ [`relocateNAR`](../nix/src/libstore/build/derivation-builder-impl.cc#L108-L240) without requiring any external tools in the sandbox.
-2. **Static Libraries (`.a` Archives) Across Bootstrap Stages (`stage0` $\to$ `stage1` $\to$ `stage2` $\to$ `stage3` $\to$ `stdenv`)**:
-   - Early GCC/glibc bootstrap stages build static `.a` archives (`libgcc.a`, `libc.a`).
-   - Standard `ar` archives store each member's byte size as a fixed-width decimal ASCII header and do not store member checksums. Because `<inputHash>` (32 chars), `<blindHash>` (32 chars), and `<outHash>` (32 chars) have the exact same byte length, `RewritingSink` relocation inside `.a` archives preserves member sizes and symbol tables without needing `ranlib`.
+### 3.2 Mode B: Full End-to-End Source Bootstrap (`hex0` $\to$ `stdenv`)
+When bootstrapping `nixpkgs` from scratch (`minimal-bootstrap` through `stdenvStages` 0–4 to final `stdenv`):
+1. **Stage 0 (`minimal-bootstrap` from `hex0`, or `bootstrap-tools` on older releases)**:
+   - On `nixpkgs-unstable` (`x86_64-linux`), `stdenv` boots **100% from source** starting from the 357-byte `hex0` seed (`stage0-posix` $\to$ `mes` $\to$ `tinycc` $\to$ `musl` $\to$ `gcc-4.6.4` $\to$ `gcc-10.4.0`) with zero prebuilt `bootstrap-tools` binary tarball; on older releases such as NixOS 25.11, Stage 0 unpacks `bootstrap-tools` via `busybox`. In both cases, early outputs are relocated in-process by C++ [`relocateNAR`](../nix/src/libstore/build/derivation-builder-impl.cc#L108-L240) without requiring any external tools in the sandbox.
+2. **Static Libraries (`.a` Archives) Across Bootstrap Stages (`minimal-bootstrap` $\to$ `stage0` $\to$ `stage4` $\to$ `stdenv`)**:
+   - Early TinyCC/musl and GCC/glibc bootstrap stages build static `.a` archives (`crt`, `libgetopt.a`, `libtcc1.a`, `libgcc.a`, `libc.a`).
+   - Standard `ar` archives store each member's byte size as a fixed-width decimal ASCII header and do not store member checksums. Because `<inputHash>` (32 chars), `<blindHash>` (32 chars), and `<outHash>` (32 chars) have the exact same byte length, `RewritingSink` relocation inside `.a` archives preserves member sizes and symbol tables without needing `ranlib`—allowing identical static libraries compiled across distinct bootstrap stages to deduplicate to a single content-addressed store path.
 3. **Ecosystem-Level Hooks for Full Nixpkgs Coverage**:
    - Rather than overriding individual packages one by one, most non-plaintext formats in `nixpkgs` belong to language/framework ecosystems where a single hook covers thousands of packages:
      - **Python (`buildPythonPackage`)**: `*.dist-info/RECORD` files list SHA-256 hashes of installed entry-point scripts; when `relocate.sh` rewrites `$out` inside an entry-point script, `RECORD` either needs its hash updated or stripped.
@@ -129,94 +129,113 @@ When bootstrapping `nixpkgs` from scratch (`stdenvStages` 0 through final `stden
 
 ## 4. Real-World Bootstrap Verification (`casper-store`)
 
-Both Nixpkgs bootstrap chains were executed end-to-end into `casper-store` using `./nix/build/src/nix/nix-build` and [`casper-overlay.nix`](../casper-overlay.nix), producing **313 relocated derivation outputs** (`PathRewrites` rows in `casper-store/nix/var/nix/db/db.sqlite`) that converged to **274 unique content-addressed outputs**:
+[`bootstrap.sh`](../bootstrap.sh) was executed end-to-end against upstream `nixpkgs-unstable` into a clean `casper-store` using `./nix/build/src/nix/nix-build` and [`casper-overlay.nix`](../casper-overlay.nix):
 
-1. **Source-Only `stage0-posix` Bootstrap (49 Derivations)**:
-   - Built from `hex0-1.6.0` (`stage0-posix-1.6.0-source`) through `hex1`, `hex2`, `catm`, `M0`, `cc_arch`, `M2-0`, `M2`, `blood-elf-0`, `M1-0`, `hex2-1`, `M1`, `hex2`, `kaem-unwrapped`, `mescc-tools`, `mescc-tools-extra`, and `kaem-1.6.0` (`/nix/store/5ac8fyvhhjj13m4r54kc53b6bbhy7nfw-kaem-1.6.0`).
-2. **Full Nixpkgs `stdenv` Bootstrap (`stage0` $\to$ `stage1` $\to$ `stage-xgcc` $\to$ `stage2` $\to$ `stage3` $\to$ `stage4` $\to$ `stdenv-linux` $\to$ `hello-2.12.2`)**:
-   - **264 `stdenv` bootstrap outputs** built, blinded, content-hashed, and relocated across all bootstrap stages via the streaming `NAR` $\to$ `NAR` pipeline without a single Nixpkgs package modification.
+- **Upstream Snapshot**: `NixOS/nixpkgs` `refs/heads/nixpkgs-unstable` commit [`2074cc672349f14240fb7ea90d509e0b643e9dd4`](https://github.com/NixOS/nixpkgs/commit/2074cc672349f14240fb7ea90d509e0b643e9dd4) (`2026-11-12T14:50:34Z`, tarball SHA-256 `1f7094d999ce8f424b5bc001e09a21605e7d9c5535ad8a5e46b3598b8b5235d4`).
+- **100% Source-Based Bootstrap (`hex0` $\to$ `hello-2.12.3`)**: Built **480 derivations** producing **591 relocated derivation outputs** (`PathRewrites` rows in `casper-store/nix/var/nix/db/db.sqlite`) that converged to **537 unique content-addressed store paths** (**54 duplicate outputs eliminated** across **29 deduplication groups**):
+  1. **`minimal-bootstrap` Compiler Chain from `hex0-1.9.1`**:
+     - Built from the 357-byte `hex0-1.9.1` seed through `hex1`, `hex2`, `catm`, `M0`, `M2-1.9.1`, `blood-elf`, `M1`, `mescc-tools-1.9.1`, `kaem-1.9.1`, `nyacc-1.09.1`, `mes-0.27.1`, `tinycc-boot-mes`, `tinycc-musl`, `musl-1.2.6`, `binutils-2.47`, `gcc-4.6.4`, `gcc-cxx-4.6.4`, and `gcc-10.4.0`—with zero prebuilt `bootstrap-tools` binary tarball.
+  2. **Nixpkgs `stdenv` Stages (`stage0` $\to$ `stage1` $\to$ `stage2` $\to$ `stage3` $\to$ `stage4` $\to$ `stdenv-linux` $\to$ `hello-2.12.3`)**:
+     - Continued from `minimal-bootstrap` through `linux-headers-7.3`, `glibc-2.44`, `binutils-2.46`, `gcc-16.2.0`, `coreutils-9.12`, `bash-5.3p20`, `stdenv-linux`, and `hello-2.12.3` via the streaming `NAR` $\to$ `NAR` pipeline.
 
 ### 4.1 Key Bootstrap Milestones (`inputPath` $\to$ Content-Addressed `outputPath`)
 
 | Stage / Milestone | Evaluation Input Path (`<inputHash>-<name>`) | Relocated Content-Addressed Path (`<outHash>-<name>`) |
 | :--- | :--- | :--- |
-| **`stage0-posix` (`hex1-1.6.0`)** | `/nix/store/pvk596baqdg5hnmvnjsb1fbca6bz5j4v-hex1-1.6.0` | `/nix/store/3m87j2yh62phlzc3f5nhj4l0m75n55x1-hex1-1.6.0` |
-| **`stage0-posix` (`M2-1.6.0`)** | `/nix/store/3vmryl2mpq9rib67bi6clfvb44nym9jr-M2-1.6.0` | `/nix/store/f2xdw0rhj6k5a3dsirczd0gnlf53f50x-M2-1.6.0` |
-| **`stage0-posix` (`mescc-tools`)** | `/nix/store/k7847sdmcmfqvgpc7ycd5a4wpx49xan0-mescc-tools-1.6.0` | `/nix/store/97n0b1z6g61n330w9qn5r6b1mc4yawzl-mescc-tools-1.6.0` |
-| **`stage0-posix` (`kaem-1.6.0`)** | `/nix/store/9a0qmi15cidrn9kca5j820dw0qan13c8-kaem-1.6.0` | `/nix/store/5ac8fyvhhjj13m4r54kc53b6bbhy7nfw-kaem-1.6.0` |
-| **Stage 0 (`bootstrap-tools`)** | `/nix/store/razasrvdg7ckplfmvdxv4ia3wbayr94s-bootstrap-tools` | `/nix/store/30n2a6x7vsvxj1mzvrvhg8m89f41ci37-bootstrap-tools` |
-| **Stage 0 (`stdenv-linux`)** | `/nix/store/ajrdf015k5ipn89gyh06isniabysrkcw-bootstrap-stage0-stdenv-linux` | `/nix/store/s5j2ficvrlkjb6dhw9ay9zgglh573w98-bootstrap-stage0-stdenv-linux` |
-| **Stage 1 (`stdenv-linux`)** | `/nix/store/wkqjkkwnwhs270sav1mrdz089cmydmj8-bootstrap-stage1-stdenv-linux` | `/nix/store/dk3i95c49wjpsa5xc62cby077qk83y3a-bootstrap-stage1-stdenv-linux` |
-| **Stage xgcc (`xgcc-14.3.0`)** | `/nix/store/nvv5arlnf72xkvpnmnw78ywgdnvx92q3-xgcc-14.3.0` | `/nix/store/g5inkmc4j8pdclpyi2z37vszcr252wib-xgcc-14.3.0` |
-| **Stage xgcc (`stdenv-linux`)** | `/nix/store/azdg07c0qmzmj6cpnbpgmrh9gk1jl91d-bootstrap-stage-xgcc-stdenv-linux` | `/nix/store/75x0pfcacqpsf6h8ppd9fz983r08n69n-bootstrap-stage-xgcc-stdenv-linux` |
-| **Stage 2 (`linux-headers-6.16.7`)** | `/nix/store/9a975kwlj5hyfq8y6hsapfaj5pj7g090-linux-headers-6.16.7` | `/nix/store/b7xga9z9x1rbkj6agr51pgg9v4yf4d5w-linux-headers-6.16.7` |
-| **Stage 2 (`glibc-2.40-224`)** | `/nix/store/7nbi22pcc92y2fqbkyp7h3srvvklmckb-glibc-2.40-224` | `/nix/store/94f38yglcijsz5a8kv7hr3bz2w1is1r0-glibc-2.40-224` |
-| **Stage 3 (`stdenv-linux`)** | `/nix/store/j7sbhs7c8wi0rxfh2f8wyngjdj5lb3z5-bootstrap-stage3-stdenv-linux` | `/nix/store/rpnwisgkssmkndx9yamgvhgmh376ipb7-bootstrap-stage3-stdenv-linux` |
-| **Stage 4 (`gcc-14.3.0`)** | `/nix/store/ipr6y28viyqkhkg58rdvy27m01q5j5nh-gcc-14.3.0` | `/nix/store/ixh56dfh4lq5r87cfl8v3dv7q230hw0h-gcc-14.3.0` |
-| **Stage 4 (`coreutils-9.8`)** | `/nix/store/hqkszxk2c0cxvd04xa4gsaqs182dw8l2-coreutils-9.8` | `/nix/store/nkydbxdsfg1jjyli6mzz5ahfj3m6mj0h-coreutils-9.8` |
-| **Stage 4 (`bash-5.3p3`)** | `/nix/store/3hgg7pr65imdrifqqh3flg3arvkc2r22-bash-5.3p3` | `/nix/store/3894m0zrq35da26lpk0kk2lasdmc98vw-bash-5.3p3` |
-| **Final `stdenv-linux`** | `/nix/store/0i25iw4373868kjqhafvmd6pn1wwzkh3-stdenv-linux` | `/nix/store/5cbirwzcqq4rdwib11lh1k5rbz3xma8l-stdenv-linux` |
-| **Final `hello-2.12.2`** | `/nix/store/18bbdvag5v2f3d4y37pdbkzvh7s71cw4-hello-2.12.2` | `/nix/store/sn0pwh1agh2hnlbgm61ra3qr6yiz6ja8-hello-2.12.2` |
+| **`stage0-posix` (`hex1-1.9.1`)** | `/nix/store/p5v3r1q7p5jxl9b4z8r3qla5x0kppjlf-hex1-1.9.1` | `/nix/store/7f0rmzg1bb3n74fv2rwh7wvgp4sz9gds-hex1-1.9.1` |
+| **`stage0-posix` (`M2-1.9.1`)** | `/nix/store/c933x2407ahyia5bd2z39109zsk2q2b7-M2-1.9.1` | `/nix/store/jwknzxfmc1l3bmm2drvjn3s09mjhr20w-M2-1.9.1` |
+| **`stage0-posix` (`mescc-tools-1.9.1`)** | `/nix/store/53zd871rgpcvi7qmqkffxhzaiq0is7k4-mescc-tools-1.9.1` | `/nix/store/z2nvwx19zzivivvklxp62x3x50cg8gy2-mescc-tools-1.9.1` |
+| **`stage0-posix` (`kaem-1.9.1`)** | `/nix/store/n3mfz1lj8rbz0cspkfrvxiy9h5hm0vzg-kaem-1.9.1` | `/nix/store/126ag9igipwpls7j044pndfyav61dirx-kaem-1.9.1` |
+| **`minimal-bootstrap` (`mes-0.27.1`)** | `/nix/store/g090bwdzxw6dsk2i5mxg5mpi939kwc2l-mes-0.27.1` | `/nix/store/0q85hkwyq9cgqvaj9n16fqfxgjxbis51-mes-0.27.1` |
+| **`minimal-bootstrap` (`tinycc-boot-mes`)** | `/nix/store/wdv8qidsgiljsi30145zip0i2q8f8f7f-tinycc-boot-mes-unstable-2024-07-07` | `/nix/store/b5m70sa2kp62wxisgq8ngfz838wqflq0-tinycc-boot-mes-unstable-2024-07-07` |
+| **`minimal-bootstrap` (`tinycc-musl`)** | `/nix/store/pbs7i6imdnzbksfh2adfflicxj026kr2-tinycc-musl-unstable-2025-12-03` | `/nix/store/ai5m42zkn0mjxn4lj3sg6rpliazbv63c-tinycc-musl-unstable-2025-12-03` |
+| **`minimal-bootstrap` (`musl-1.2.6`)** | `/nix/store/19sak883ism6cb7sa8552c07ami7csa0-musl-1.2.6` | `/nix/store/r62zywb0yfv81nwhp6xr85n0j0f2l02a-musl-1.2.6` |
+| **`minimal-bootstrap` (`gcc-4.6.4`)** | `/nix/store/f4cfdyd3kl579xgqhbm175mw27rc83xk-gcc-4.6.4` | `/nix/store/abbr1xbyg3j0nv9nsx784mjmwkwgmga4-gcc-4.6.4` |
+| **`minimal-bootstrap` (`gcc-10.4.0`)** | `/nix/store/nxwifn8x71rbvz4pzfk3wwvasm2pqsl7-gcc-10.4.0` | `/nix/store/firwvq07zbnlm6i0d8cxcq795mfc8lid-gcc-10.4.0` |
+| **Stage 0 (`stdenv-linux`)** | `/nix/store/5m3z6j447d37c3vvl1lla8jz5lkwgrdk-bootstrap-stage0-stdenv-linux` | `/nix/store/1wq633v4a13w36x1s38cgnvpff4iqq74-bootstrap-stage0-stdenv-linux` |
+| **Stage 1 (`stdenv-linux`)** | `/nix/store/74cg5ywm4snpwglnsj8zjfjlgn76gab1-bootstrap-stage1-stdenv-linux` | `/nix/store/7k1sxgphicqdnwszsai3qf7pwh667v2h-bootstrap-stage1-stdenv-linux` |
+| **Stage 2 (`linux-headers-7.3`)** | `/nix/store/p1aci5ysxkc3zh02ydh11fwqpaqsq3c4-linux-headers-7.3` | `/nix/store/v6bvjjn9qmqh9in14d0iflfblxl2pi00-linux-headers-7.3` |
+| **Stage 2 (`glibc-2.44`)** | `/nix/store/ifg63pi3mbvdx0dqpd80lnghjwaqpqiv-glibc-2.44` | `/nix/store/ir5iwv6k4hxfqws7cxwy69n39i9s0gbs-glibc-2.44` |
+| **Stage 3 (`stdenv-linux`)** | `/nix/store/azdg9gndwjb9liisb585yxzg15c8wg65-bootstrap-stage3-stdenv-linux` | `/nix/store/7hp9b49rf8c8kb4szsijislfcsyc87i8-bootstrap-stage3-stdenv-linux` |
+| **Stage 4 (`stdenv-linux`)** | `/nix/store/4d95cawixqkmi505bmvvizyp28p9zjfr-bootstrap-stage4-stdenv-linux` | `/nix/store/c4dihkcg7ai1fx16zz5wz9r8ny8vpdlp-bootstrap-stage4-stdenv-linux` |
+| **Stage 4 (`gcc-16.2.0`)** | `/nix/store/rp1zq1p0rjfdg99rb2cfs14871y6cqaj-gcc-16.2.0` | `/nix/store/3zqg8qxx9ywh95ykhk44bkc9k5n8qvzl-gcc-16.2.0` |
+| **Stage 4 (`coreutils-9.12`)** | `/nix/store/a50ml7za6h61m4mv4cdbvkl33c6sx5yn-coreutils-9.12` | `/nix/store/ykkhycflm4r7xbqcpfgym6mg0s8wi2by-coreutils-9.12` |
+| **Stage 4 (`bash-5.3p20`)** | `/nix/store/hasnvc0j36gg6qrdsfcx7yivx3c2bpqr-bash-5.3p20` | `/nix/store/gs0xq5c4rqh3bigb7bxx4fc4php2nyw8-bash-5.3p20` |
+| **Final `gcc-16.2.0`** | `/nix/store/8x94na5lhckj4p05hlb0l1jkzqgg7yg0-gcc-16.2.0` | `/nix/store/s6wa8hzcahyaafx71yin40jzmvjq4b4w-gcc-16.2.0` |
+| **Final `stdenv-linux`** | `/nix/store/z2wyfgcxn7brfklv373fz0l9k8b5pwsg-stdenv-linux` | `/nix/store/gnmygfqjdj4glmc64xnx0j3s4yslz1dh-stdenv-linux` |
+| **Final `hello-2.12.3`** | `/nix/store/2g1jryvsiljc69g8yi3sqzcj9cvwfqyy-hello-2.12.3` | `/nix/store/5q3rabjwwd2lanj8can9i0l2kk3yl5rp-hello-2.12.3` |
 
-### 4.2 Cross-Stage Content-Addressed Deduplication (20 Output Groups Across Stages 0–4)
-Querying `PathRewrites` in `casper-store/nix/var/nix/db/db.sqlite` showed **20 output groups** (39 duplicate outputs eliminated) where derivations built across different bootstrap stages (with distinct `.drv` hashes and toolchains) produced identical blinded content and automatically converged to the exact same content-addressed store path:
+### 4.2 Cross-Stage Content-Addressed Deduplication (29 Output Groups Across `minimal-bootstrap` & Stages 0–4)
+Querying `PathRewrites` in `casper-store/nix/var/nix/db/db.sqlite` showed **29 output groups** (**54 duplicate outputs eliminated**) where derivations built across different bootstrap stages (with distinct `.drv` hashes and toolchains) produced identical blinded content and automatically converged to the exact same content-addressed store path—including compiled C object files, static libraries, and binaries (`crt`, `libgetopt.a`, `libc.a`, `libtcc1.a`, `zlib-1.3.2-static`, `gcc-wrapper-simple-program-16.2.0`, and `casper-relocate-1.0.0`):
 
 | Converged Content-Addressed `outputPath` | Stage Count | Distinct Input Hash Prefixes (`inputPath`) |
 | :--- | :---: | :--- |
-| `/nix/store/h2zm8gx40nhw8sj8757xh5pcpglw8gnb-gnu-config-2024-01-01` | **6** | `nkp2jjfx`, `wqzpxm4j`, `y6alivz8`, `xdj1hdnn`, `nynfiaxg`, `ay97s1f2` |
-| `/nix/store/1sid5bc540bia6li9ggk7sc7di5nm89h-update-autotools-gnu-config-scripts-hook` | **6** | `ivs0xima`, `w3f3v1va`, `44bzap4q`, `zmbyl8wb`, `zxixwkhw`, `4s62rh5i` |
-| `/nix/store/isksmxafyj4ldqkn6zwbrz4cq1rp7qxz-bash-5.3p3-info` | **5** | `pqqcpb5q`, `4pz2asx9`, `k52n6fp4`, `ycy1vg2n`, `f4q2risa` |
-| `/nix/store/mflf4dq4x1wmsglpra9gsnq49z8an7mf-bash-5.3p3-man` | **5** | `vsrzjz05`, `83s5r9zn`, `irvzpqbc`, `3br10pn2`, `y3hrz22j` |
-| `/nix/store/xdkj3ydj7q3px091xay4wx9hgwl8hidx-bash-5.3p3-doc` | **5** | `sidp11qn`, `5i8iqc88`, `sia47i7m`, `d5h5g51l`, `m569srhy` |
-| `/nix/store/ii3700nq7nnfhp8zfssjczarw60izsdv-nuke-references` | **4** | `rxxjh38q`, `wwiqgin8`, `jrabk1pr`, `2kh0hlwq` |
-| `/nix/store/0xz45i1lvf06pjxydpddid2nglir332r-expand-response-params` | **2** | `gk36k5fd`, `bzkq151p` *(compiled C binary deduplicated across stages)* |
-| `/nix/store/kcrsbmlryh3rjgmx1ns9lrshsj3i6zxs-bash-5.3p3-debug` | **2** | `2hg82qsg`, `i7p4sb8d` |
-| `/nix/store/78x0j5kl28kgf46699s3pisjafbax3j0-binutils-2.44-man` | **2** | `2b43ga3y`, `5951bdp9` |
-| `/nix/store/k8yn35adnbq8vivkljg6bjb10lh5bwfx-binutils-2.44-info` | **2** | `b4b5lfds`, `ynws37nl` |
-| `/nix/store/6i8rmmr9b3w6nfm1mbad4a8rj05ykjb8-binutils-wrapper-2.44-man` | **2** | `641ksb94`, `iwh74pj4` |
-| `/nix/store/5ddi5vhhma11h30v7mqa5b9ipq63fqcj-binutils-wrapper-2.44-info` | **2** | `0s7vn1v9`, `fmf1v6h8` |
-| `/nix/store/8w7bd80468acw2ki886x4mcz9jw52b13-python-setup-hook.sh` | **2** | `4441jg4a`, `1ay695zg` |
-| `/nix/store/p8mqjin5gf9acxzdgk722ylh6d50vxis-gmp-6.3.0-info` | **2** | `3g3f04ja`, `a945qkvw` *(distinct from `2ypdc6zv6xxgg65aykz0177m9wgn4rga-gmp-with-cxx-6.3.0-info` via name-mixed `casper:out` derivation)* |
-| `/nix/store/r2dg2j6svx26z7z9kkp6b5laskkxmr21-mpfr-4.2.2-doc` | **2** | `3m1319j9`, `fiqrdsdy` |
-| `/nix/store/wc4dm2kbkipfx437qa39aq0kc39q1lxd-mpfr-4.2.2-info` | **2** | `s6w6ji55`, `5fmqqppa` |
-| `/nix/store/3zpq1q2dnsklbf41wlvfkx8rwjf2s8d4-xz-5.8.3-doc` | **2** | `x4qgpmhz`, `h4ch4ldb` |
-| `/nix/store/2kfnv0hyikydq1mmfpqh7ld64wq96fdl-xz-5.8.3-man` | **2** | `yzci0g7r`, `34qc1s1k` |
-| `/nix/store/29a0hwkx4wfj3xbiz5233gqg9g1g6qwh-libxcrypt-4.5.2-man` | **2** | `cc7r666h`, `yhficm51` |
-| `/nix/store/fzm5c1csn6slg3zsb850lznsy96mg52k-gettext-0.25.1-info` | **2** | `nky8g413`, `wripq293` |
+| `/nix/store/aqm99gyq87za2gs0h111gf90h5j08znh-crt` | **6** | `c100i3wl`, `8lbfxzhh`, `ax6p3zks`, `cr2fwxa8`, `in4lxyl2`, `8vshzzx0` *(compiled C runtime objects)* |
+| `/nix/store/h2zm8gx40nhw8sj8757xh5pcpglw8gnb-gnu-config-2024-01-01` | **6** | `n41wrnzj`, `gqbwba4h`, `x6lr15n7`, `vjh3adfl`, `h4mv53xy`, `zf3wrhmm` |
+| `/nix/store/1sid5bc540bia6li9ggk7sc7di5nm89h-update-autotools-gnu-config-scripts-hook` | **6** | `qhhb6xz5`, `iryy6bdg`, `5vy4gk8y`, `sk59smk7`, `lix213f8`, `mx9g3gy5` |
+| `/nix/store/5l370ygzr8z5bqwznnm6nzj8wslwaci7-libgetopt.a` | **5** | `rsxndyy0`, `arzgm997`, `k79y1lnr`, `0kwsy1cm`, `wgfv3l0v` *(compiled C static library)* |
+| `/nix/store/dm6q61ww6sj6nryvvpfnp3vnqd15jdl9-bash-5.3p20-doc` | **5** | `7vwnwicw`, `is5rwjyl`, `bvn9w9iv`, `819c065z`, `plf6jzl8` |
+| `/nix/store/ckz06r96n7si38hsw57kwg3hhcpcpb31-bash-5.3p20-info` | **5** | `vzp36ld0`, `dsa4vab6`, `484km3jz`, `jvjppgsw`, `b4sk68p1` |
+| `/nix/store/qm1m7lwjglsvq40mgx8sfnn6qf39xi9l-bash-5.3p20-man` | **5** | `zdsk5ryd`, `vrcsw3ij`, `ks0d6ma6`, `iqd3rbnv`, `6bc8vbgx` |
+| `/nix/store/z2k3gfnq9jdx1s28a1rx6vg8znd17qzn-libc.a` | **3** | `p80l2blh`, `da2divww`, `i0j9n2qm` *(compiled C static library)* |
+| `/nix/store/xs86i9sqqcgg6mcsnzpbq99jss90xn2m-libtcc1.a` | **2** | `naj0sji0`, `d12mrwn6` *(compiled TinyCC runtime library)* |
+| `/nix/store/v6n18fglz508l2wipjzd2p1ggkm3kvqc-libtcc1.a` | **2** | `rh4xf4rv`, `42d2jjf1` |
+| `/nix/store/2fy7jqh740kcrhyw64h72m4qhafvly99-crt` | **2** | `hh534gvz`, `2adssbqg` |
+| `/nix/store/g3w1wr54b7z25bi8444vpbdg57m32yzq-libc.a` | **2** | `ypk0x6wj`, `0i45h2yq` |
+| `/nix/store/2ij5fxacpw3fvgcpxim9ym1gzjp4kwp1-libgetopt.a` | **2** | `zamp026s`, `y4bgya5h` |
+| `/nix/store/7vjc10pgi6dgc2q9c77h8w3dk9n49xgm-libtcc1.a` | **2** | `4fm23ri1`, `l4n1piyw` |
+| `/nix/store/s29di2xr2v2160c4zd1nwcaki7i2d3y6-xz-get-version-5.8.3` | **2** | `6fyhgpkx`, `1c8jfjg7` |
+| `/nix/store/x7wig6vw6xm4a3clps7f8c9awzsabhab-gcc-wrapper-simple-program-16.2.0` | **2** | `rxqlb5sp`, `grsw2j11` *(compiled C binary)* |
+| `/nix/store/gzd38an8gszgj6akdslinbfzqa9g0hyq-zlib-1.3.2-static` | **2** | `1m657k6i`, `m6zmblhc` *(compiled C static library)* |
+| `/nix/store/p8mqjin5gf9acxzdgk722ylh6d50vxis-gmp-6.3.0-info` | **2** | `8xv16yrs`, `73mxh8zg` |
+| `/nix/store/r2dg2j6svx26z7z9kkp6b5laskkxmr21-mpfr-4.2.2-doc` | **2** | `3bjg2ip7`, `r7cwy8ic` |
+| `/nix/store/wc4dm2kbkipfx437qa39aq0kc39q1lxd-mpfr-4.2.2-info` | **2** | `3hlvw6ip`, `21111m24` |
+| `/nix/store/7yzszhjc0rc672w7fc2f7yy144laawsq-gettext-1.0-info` | **2** | `hlqjm2h5`, `qx98d7fz` |
+| `/nix/store/48h0sips9jb6v0hj1ifm8p6x9iy9b8p2-binutils-2.46-info` | **2** | `1pp92wmf`, `yxq7631r` |
+| `/nix/store/6m4dwraccjx17z33jy2vd2rzx34p8dsv-binutils-2.46-man` | **2** | `09557wj1`, `5p1a23zr` |
+| `/nix/store/8ws7417rr2580vpnki6giz3f9i2rlk7q-binutils-wrapper-2.46-info` | **2** | `f9fpklnz`, `dymds4bc` |
+| `/nix/store/9x36mllk0gi7mf5xg1ld9198f8c0bxil-binutils-wrapper-2.46-man` | **2** | `31g88k4i`, `v74w87h1` |
+| `/nix/store/fmw3dqw6q6ib0ycyv9nji5ddbrznl0bi-xz-5.8.4-doc` | **2** | `5pqcixb4`, `yfvz9jfj` |
+| `/nix/store/vylvm9x06p1d72bk6iqi4pv6kp2m9izz-xz-5.8.4-man` | **2** | `jyn67q39`, `qkq4pc2d` |
+| `/nix/store/nrb7wgxzbdc1p38lg1km2dp68fy8q1q4-version-check-hook` | **2** | `2q6q3k8x`, `133b732l` |
+| `/nix/store/q9pdkyi530rxzi17l6winsp680z842mn-casper-relocate-1.0.0` | **2** | `6pvpanb6`, `dliqgcrg` *(statically-linked C relocator binary)* |
 
 ### 4.3 Key Technical Findings from the Real Bootstrap
 1. **Zero Injected Files & Pure `NAR` $\to$ `NAR` In-Process Stream Relocation**:
-   - In `minimal-bootstrap` (`stage0-posix`), early derivations (`hex1`, `hex2`, `M0`, `M2`, `blood-elf-0`) execute in a bare sandbox with **no `/bin/sh`, `find`, or `sed`**, and many outputs are single regular executable files (`S_ISREG`) rather than directories (`S_ISDIR`).
-   - Because [`relocateNAR`](../nix/src/libstore/build/derivation-builder-impl.cc#L108-L240) operates directly on the NAR stream in C++ and only spawns `$out/nix-support/relocate.sh` when a package explicitly provides one, all 313 bootstrap outputs relocated in-process without injecting any extra files into `$out`.
+   - In `minimal-bootstrap` (`stage0-posix` through `tinycc` and `gcc-4.6.4`), early derivations (`hex1`, `hex2`, `M0`, `M2`, `blood-elf-0`) execute in a bare sandbox with **no `/bin/sh`, `find`, or `sed`**, and many outputs are single regular executable files (`S_ISREG`) rather than directories (`S_ISDIR`).
+   - Because [`relocateNAR`](../nix/src/libstore/build/derivation-builder-impl.cc#L108-L240) operates directly on the NAR stream in C++ and only spawns `$out/nix-support/relocate.sh` when a package explicitly provides one, all early bootstrap outputs relocated in-process without injecting any extra files into `$out`.
 2. **Selective Binary Cache Substitution (`type(*drv).isCA()`)**:
-   - Standard binary caches (`cache.nixos.org`) index input-addressed derivations by `<inputHash>-<name>`, whereas `CAFixed` derivations (source tarballs, `bootstrap-tools.tar.xz`, `stage0-posix` seeds) are indexed by fixed content hash.
+   - Standard binary caches (`cache.nixos.org`) index input-addressed derivations by `<inputHash>-<name>`, whereas `CAFixed` derivations (source tarballs and `stage0-posix` seeds) are indexed by fixed content hash.
    - Restricting binary cache substitution to `type(*drv).isCA()` in [`DerivationGoal::haveDerivation`](../nix/src/libstore/build/derivation-goal.cc#L93) and [`Store::queryMissing`](../nix/src/libstore/misc.cc#L268) allows CASPER to fetch fixed-output source tarballs from `cache.nixos.org` while building and relocating all input-addressed derivations locally.
 3. **Resolving `allowedReferences` & `disallowedRequisites` After Relocation**:
-   - Foundational packages in `nixpkgs` (`glibc-2.40-224`, `gcc-14.3.0`, `bootstrap-stage*-stdenv-linux`) specify strict `allowedReferences`, `allowedRequisites`, `disallowedReferences`, and `disallowedRequisites` lists containing evaluation-time `<inputHash>-<name>` store paths.
+   - Foundational packages in `nixpkgs` (`glibc-2.44`, `gcc-16.2.0`, `bootstrap-stage*-stdenv-linux`) specify strict `allowedReferences`, `allowedRequisites`, `disallowedReferences`, and `disallowedRequisites` lists containing evaluation-time `<inputHash>-<name>` store paths.
    - Updating [`checkOutputs`](../nix/src/libstore/build/derivation-check.cc#L23-L52) to resolve those paths through `store.resolveInputPath` (and the current derivation's `outputs` map) allowed every bootstrap stage's reference checks to pass without modifying `nixpkgs`.
-4. **Empirical `.gz` Recompression in Multi-Output Packages**:
-   - Multi-output packages (`outputs = [ "out" "man" ... ]`) whose `.gz` manpages embed sibling `$out` references (`file-5.45-man`, `gettext-0.25.1-man`) are topologically ordered after `$out`, symlinked to [`casper-relocate`](../casper-relocate.c) when `.gz` files are present, and rewritten in-stream:
-     1. `rzkzgcpi35061aphd7nvw9q4567ws09d-file-5.45-man`: `share/man/man1/file.1.gz`, `share/man/man3/libmagic.3.gz`, and `share/man/man4/magic.4.gz` (rewrote `/nix/store/018l43lbsqbrsasrfdcxxb5s4s161fkr-file-5.45/share/misc/magic*` $\to$ `/nix/store/40xf2hs1hr0934ad6a5w1kb6krc16g7a-file-5.45/share/misc/magic*`).
-     2. `vbrchwv2wc4s32cdnf6ns12b751b5v3f-gettext-0.25.1-man` (Stage 3): `share/man/man1/gettext.1.gz` and `share/man/man1/ngettext.1.gz` (rewrote `/nix/store/qawh4dvis37x3nvvsd1n53v13gy9yq9g-gettext-0.25.1/share/locale` $\to$ `/nix/store/mj7f7qmykivmz7cmwq62gn0zd5w173is-gettext-0.25.1/share/locale`).
-     3. `8gjj4hnbj7fr4bfyd2yp5bfvbx5lh7d7-gettext-0.25.1-man` (Stage 4): `share/man/man1/gettext.1.gz` and `share/man/man1/ngettext.1.gz` (rewrote `/nix/store/yfnzmmv8r4wzgg2f0fci4xl874lm7w5x-gettext-0.25.1/share/locale` $\to$ `/nix/store/6jz09pa69k6nfijv6ij5laf6k4m8qh2z-gettext-0.25.1/share/locale`).
+4. **Empirical `.gz` Recompression Across Self-Referencing & Multi-Output Packages**:
+   - Outputs containing `.gz` files (`493` outputs in the `nixpkgs-unstable` GNOME closure) automatically receive `$out/nix-support/relocate.sh -> ${casper-relocate}/bin/casper-relocate` and rewrite compressed self-references deterministically in-stream, passing both Pass 3 fixed-point verification and offline `nix-hash --casper` verification:
+     1. `020qzyqpxw8ngbpjyq8di8nmszhscix7-xkeyboard-config-2.49`: `share/man/man7/xkeyboard-config-2.7.gz` (rewrote `/nix/store/9shnara8yfzvp4xsxcpaiwqihpmnaybl-xkeyboard-config-2.49` $\to$ `/nix/store/020qzyqpxw8ngbpjyq8di8nmszhscix7-xkeyboard-config-2.49`).
+     2. `1g493f8bri5dwrd1vc0kcadgnq7n6qjz-rhash-1.4.6`: `share/man/man1/rhash.1.gz` (rewrote `/nix/store/dp1km76rk17fxasqsb8dl3sbf6lrvdzz-rhash-1.4.6` $\to$ `/nix/store/1g493f8bri5dwrd1vc0kcadgnq7n6qjz-rhash-1.4.6`).
+     3. `4wx239vi7wy48mxnxrrd7ik3w7ac6a6r-xorg-server-21.1.25`: `share/man/man5/xorg.conf.5.gz` and `share/man/man1/Xserver.1.gz` (rewrote `/nix/store/ghxkzxdinvd3z0fvr23wy8q1s924ss14-xorg-server-21.1.25` $\to$ `/nix/store/4wx239vi7wy48mxnxrrd7ik3w7ac6a6r-xorg-server-21.1.25`).
 
 ---
 
-## 5. Full NixOS 25.11 GNOME 49 Wayland Desktop (`pkgs.nixosTests.gnome`)
+## 5. Full NixOS Unstable GNOME 51.0 Wayland Desktop (`pkgs.nixosTests.gnome`)
 
-Building `pkgs.nixosTests.gnome` from NixOS 25.11 on top of the bootstrapped `casper-store` compiled and verified **2,717 derivations** (**5,213 relocated outputs**, deduplicated into **5,077 unique content-addressed store paths**) and booted the resulting NixOS system inside QEMU into a full GNOME 49 Wayland desktop session (`gdm-49.2` $\to$ `gnome-shell-49.4` $\to$ `org.gnome.Console`):
+Building `pkgs.nixosTests.gnome` from `nixpkgs-unstable` ([`2074cc672349f14240fb7ea90d509e0b643e9dd4`](https://github.com/NixOS/nixpkgs/commit/2074cc672349f14240fb7ea90d509e0b643e9dd4), `2026-11-12T14:50:34Z`) on top of the source-bootstrapped `casper-store` compiled and verified **3,395 relocated derivations** (**5,712 relocated outputs**, deduplicated into **5,551 unique content-addressed store paths**—eliminating **161 duplicate outputs**) and booted the resulting NixOS system inside QEMU (`qemu-11.1.2` + `virtiofsd-1.14.0`) into a full GNOME 51.0 Wayland desktop session (`gdm-51.0` $\to$ `mutter-51.0` $\to$ `gnome-shell-51.0` $\to$ `org.gnome.Console`), passing all `nixosTests.gnome` subtests (in addition to the earlier NixOS 25.11 GNOME 49.4 verification at **2,717 derivations** / **5,213 relocated outputs** $\to$ **5,077 unique content-addressed store paths**):
 
 | Component | Evaluation Input Path (`<inputHash>-<name>`) | Relocated Content-Addressed Path (`<outHash>-<name>`) |
 | :--- | :--- | :--- |
-| **`llvm-21.1.7`** | `/nix/store/1nh1d0r41cvjzm2rrsfn4v3738sgdzk1-llvm-21.1.7` | `/nix/store/q0jlx0ncwd38rk2a66mh5rfyxw1f51xk-llvm-21.1.7` |
-| **`rustc-1.91.1`** | `/nix/store/smayjzjmy57p88layrir2j0df9p19d0r-rustc-1.91.1` | `/nix/store/a52dy2qn8pvs5dm7axcswq85d0v74ywa-rustc-1.91.1` |
-| **`linux-6.12.90`** | `/nix/store/zvzfn5r5s9jzgkphzjxlxnwvz9bycg55-linux-6.12.90` | `/nix/store/dlwx8klwxbr6ikh2ry4asb3y6spz2pij-linux-6.12.90` |
-| **`initrd-linux-6.12.90`** | `/nix/store/4jg0xdlivm6mfysaa07in3zm3hnxp5dl-initrd-linux-6.12.90` | `/nix/store/0aq16d0krb14hl3ynhkmlrd251vw5759-initrd-linux-6.12.90` |
-| **`mesa-25.2.6`** | `/nix/store/qff7aiydyci9rfwl74giqgdyqg3ly0fn-mesa-25.2.6` | `/nix/store/nkqqsswfx5idyi6zsws5d09mm7gbjhhg-mesa-25.2.6` |
-| **`gtk4-4.20.3`** | `/nix/store/m20v0xzsfp5v6s5djs05amh99kgikkx0-gtk4-4.20.3` | `/nix/store/7x82lp54dyfc97xpp6yjkknj1mjzjcg7-gtk4-4.20.3` |
-| **`webkitgtk-2.52.3+abi=6.0`** | `/nix/store/wgf1fd8rb04p70gf7rv1s2ir9i5fl6mf-webkitgtk-2.52.3+abi=6.0` | `/nix/store/zvrv66nwzp7n5c4yafjg52dh95r7h8hn-webkitgtk-2.52.3+abi=6.0` |
-| **`mutter-49.4`** | `/nix/store/7x5x8216y69flsfryzsbs9s7ywhpm3dg-mutter-49.4` | `/nix/store/m8apa1zh0j808my91a3lzajd2vw067vw-mutter-49.4` |
-| **`gdm-49.2`** | `/nix/store/43v4nk5bg1214r8wa9nnrp6k40wpcpha-gdm-49.2` | `/nix/store/6xjk8zx3jf5jg85ch965219x45nam5dm-gdm-49.2` |
-| **`gnome-shell-49.4`** | `/nix/store/iq6ammhk11wnyh1yrszl014iwwnbpipl-gnome-shell-49.4` | `/nix/store/q1v2v4vl5rn2jzgramdlyhk4pg1ldkjv-gnome-shell-49.4` |
-| **`nixos-system-machine-test`** | `/nix/store/r2f1rzw1w4y8n0hpbp4p97sckzxyxpkf-nixos-system-machine-test` | `/nix/store/73j7lkqy0diqwvq6jq7xl8waqxx2phpn-nixos-system-machine-test` |
-| **`nixos-test-driver-gnome`** | `/nix/store/yvnxkflc0kpzshxjr60k4ggjgyq7dmmq-nixos-test-driver-gnome` | `/nix/store/6d3sc56rp9xl6ag2c5d3c5fbwswazvhh-nixos-test-driver-gnome` |
+| **`python3-3.14.10`** | `/nix/store/wxnydg8k9v4m3myavyasbxb2j3l48wn5-python3-3.14.10` | `/nix/store/388rb79dnwfqb7hjhp2x60mvlpws58wc-python3-3.14.10` |
+| **`llvm-22.1.8`** | `/nix/store/canpyf1pis85qf3av6abdjvwlzz1z60j-llvm-22.1.8` | `/nix/store/b2m1ah971p78zz7jh13sjp11x3nr5lhi-llvm-22.1.8` |
+| **`rustc-1.99.1`** | `/nix/store/4i9hh2l7pkp5yqxhdg3gqskpixx1crv7-rustc-1.99.1` | `/nix/store/0mj2ljdk1347wd1d5x7lxcwhb6x6zqj7-rustc-1.99.1` |
+| **`linux-6.18.63`** | `/nix/store/22g8yyavxa3ssqngrdmbf4cmh8470qb4-linux-6.18.63` | `/nix/store/npfc5l33n6jp2w87dpcnf0scry0g9q5y-linux-6.18.63` |
+| **`initrd-linux-6.18.63`** | `/nix/store/clg58hhqgcbvj6nl4kapc4gqy070ggyf-initrd-linux-6.18.63` | `/nix/store/byn9jb5ghalyhwpnv72v89b18pjghldn-initrd-linux-6.18.63` |
+| **`mesa-26.3.0`** | `/nix/store/j1hdban4wp6yrk94sals912dqcf8apg7-mesa-26.3.0` | `/nix/store/brq6ld3ssjdgs27njlkgbw2ngzwd0zww-mesa-26.3.0` |
+| **`gtk4-4.24.0`** | `/nix/store/p3py5l3gq5bq08c7qk02nsqv58m2m85h-gtk4-4.24.0` | `/nix/store/l6x6x4i85fxms0dhmzaahvw1qvwqrxb1-gtk4-4.24.0` |
+| **`webkitgtk-2.54.2+abi=6.0`** | `/nix/store/y4xh1jyp9dmpq9387m29zlynyx033r6a-webkitgtk-2.54.2+abi=6.0` | `/nix/store/v7cmdwnhqisah6x15265dpv6mb89hp6h-webkitgtk-2.54.2+abi=6.0` |
+| **`mutter-51.0`** | `/nix/store/fx0jzfyld259jy1p39gyd4f0sn46s3bs-mutter-51.0` | `/nix/store/0ip1zbd2dw2qvsisn1kn1rc1srhcsmbf-mutter-51.0` |
+| **`gdm-51.0`** | `/nix/store/ljlrakw053h5w1lr5f85m99ik48wskzc-gdm-51.0` | `/nix/store/fkddkds0ilr4b25srs6x0hy7rcr6ply7-gdm-51.0` |
+| **`gnome-shell-51.0`** | `/nix/store/khx740b4m5inqddghn8mjxvdc0va6hak-gnome-shell-51.0` | `/nix/store/hrh8hahp2miqk0qvrh5b412f16l04xg3-gnome-shell-51.0` |
+| **`virtiofsd-1.14.0`** | `/nix/store/d7gwy967fasrrxl55pzgdbli4rdx8whw-virtiofsd-1.14.0` | `/nix/store/dap979abb1kbc1dymhhphwls9848mzaf-virtiofsd-1.14.0` |
+| **`qemu-for-vm-tests-11.1.2`** | `/nix/store/32zz2qizagiiw6mvihgsdskfkrj41w67-qemu-for-vm-tests-11.1.2` | `/nix/store/kvmwa8wv51jkijn172bqv22g202yvci7-qemu-for-vm-tests-11.1.2` |
+| **`nixos-system-machine-test`** | `/nix/store/d36s3mq9ffx6x88fvjr2a8569ls9f38j-nixos-system-machine-test` | `/nix/store/6s3rbmqckvam9pqfp4cghia5bya54866-nixos-system-machine-test` |
+| **`nixos-test-driver-gnome`** | `/nix/store/9l5rippz8ycwap0sjwqli21lqz76jzl4-nixos-test-driver-gnome` | `/nix/store/cvi2iy95wcm2jw5vn8lmpw0afnydzyql-nixos-test-driver-gnome` |
