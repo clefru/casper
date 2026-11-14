@@ -160,6 +160,7 @@ One way to sidestep the self-reference loop without rewriting package contents i
 
 ## 4. Documentation
 
+- **[Comparison with Other Systems (`docs/COMPARISON.md`)](docs/COMPARISON.md)**: Architectural comparison with upstream Nix (`ca-derivations` / RFC 0062, Nix 2.35 `build-trace-v2`, and `builder-rpc-v0`), Lix, Snix (`snix-castore`), Casita, GNU Guix grafts, and Spack splicing, plus open verification trade-offs.
 - **[Detailed Architecture (`docs/DETAILS.md`)](docs/DETAILS.md)**: End-to-end operational pipeline, Mermaid flowchart, `NAR` $\to$ `NAR` stream protocol, and multi-output/downstream dependency rewriting.
 - **[On-the-Fly Dependency Replacement (`docs/DEP_REPLACE.md`)](docs/DEP_REPLACE.md)**: Using `relocate.sh` to swap ABI-compatible dependencies (such as a CPU-optimized `glibc`) across built packages without recompiling.
 - **[Binary Caching & Build Non-Determinism (`docs/NON_DETERMINISM.md`)](docs/NON_DETERMINISM.md)**: `input -> output` realisation index for binary caches, build non-determinism trade-offs, and symlink strategies (`input_hash -> output_hash` vs. `competing_output_hash -> master_output_hash`) to prevent diamond dependency duplication.
