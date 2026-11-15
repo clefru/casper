@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,11 +14,22 @@
 #define NAR_MAX_NAME 255
 #define NAR_MAX_TARGET 4095
 #define NAR_MAX_DEPTH 1024
+#define CASPER_SCAN_FD 3
 
-static const char *g_old = NULL;
-static size_t g_old_len = 0;
-static const char *g_new = NULL;
-static size_t g_new_len = 0;
+typedef struct {
+    char *old_str;
+    size_t old_len;
+    const char *new_str;
+    size_t new_len;
+} reloc_pair_t;
+
+static reloc_pair_t *g_pairs = NULL;
+static size_t g_num_pairs = 0;
+static size_t g_pairs_cap = 0;
+static size_t g_min_old_len = 0;
+static size_t g_max_old_len = 0;
+static int g_all_same_len = 1;
+static int g_scan_fd = -1;
 
 static void die(const char *msg) {
     size_t len = strlen(msg);
@@ -50,6 +63,25 @@ static void write_exact(int fd, const uint8_t *buf, size_t n) {
             if (errno == EINTR)
                 continue;
             die("casper-relocate: write error on stdout");
+        }
+        off += (size_t)w;
+    }
+}
+
+static void write_scan(const uint8_t *buf, size_t n) {
+    if (g_scan_fd < 0 || n == 0)
+        return;
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(g_scan_fd, buf + off, n - off);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EBADF || errno == EPIPE) {
+                g_scan_fd = -1;
+                return;
+            }
+            die("casper-relocate: write error on scan fd 3");
         }
         off += (size_t)w;
     }
@@ -163,8 +195,64 @@ static void expect_tag(const char *expected) {
     free(tag);
 }
 
-static uint8_t *replace_all(const uint8_t *in, size_t in_len, size_t *out_len) {
-    if (g_old_len == 0 || in_len < g_old_len) {
+static int find_earliest_match(
+    const uint8_t *buf,
+    size_t buf_len,
+    size_t max_start_excl,
+    size_t *out_off,
+    size_t *out_pair_idx)
+{
+    if (g_num_pairs == 0 || max_start_excl == 0 || buf_len < g_min_old_len)
+        return 0;
+
+    int found = 0;
+    size_t best_off = 0;
+    size_t best_idx = 0;
+    size_t best_olen = 0;
+
+    for (size_t i = 0; i < g_num_pairs; i++) {
+        size_t olen = g_pairs[i].old_len;
+        if (olen > buf_len)
+            continue;
+
+        size_t max_pos = buf_len - olen;
+        if (max_pos > max_start_excl - 1)
+            max_pos = max_start_excl - 1;
+
+        if (found) {
+            if (olen > best_olen) {
+                if (max_pos > best_off)
+                    max_pos = best_off;
+            } else {
+                if (best_off == 0)
+                    continue;
+                if (max_pos > best_off - 1)
+                    max_pos = best_off - 1;
+            }
+        }
+
+        size_t search_len = max_pos + olen;
+        const uint8_t *m = (const uint8_t *)memmem(buf, search_len, g_pairs[i].old_str, olen);
+        if (m != NULL) {
+            best_off = (size_t)(m - buf);
+            best_idx = i;
+            best_olen = olen;
+            found = 1;
+        }
+    }
+
+    if (!found)
+        return 0;
+    *out_off = best_off;
+    *out_pair_idx = best_idx;
+    return 1;
+}
+
+static uint8_t *replace_all(const uint8_t *in, size_t in_len, size_t *out_len, int *out_changed) {
+    if (out_changed)
+        *out_changed = 0;
+
+    if (g_num_pairs == 0 || in_len < g_min_old_len) {
         uint8_t *copy = (uint8_t *)malloc(in_len + 1);
         if (!copy)
             die("casper-relocate: out of memory");
@@ -175,20 +263,21 @@ static uint8_t *replace_all(const uint8_t *in, size_t in_len, size_t *out_len) {
         return copy;
     }
 
-    size_t count = 0;
-    const uint8_t *p = in;
-    size_t rem = in_len;
-    while (rem >= g_old_len) {
-        const uint8_t *m = (const uint8_t *)memmem(p, rem, g_old, g_old_len);
-        if (!m)
+    size_t match_count = 0;
+    size_t final_len = 0;
+    size_t pos = 0;
+    while (in_len - pos >= g_min_old_len) {
+        size_t rel_off = 0;
+        size_t pair_idx = 0;
+        if (!find_earliest_match(in + pos, in_len - pos, in_len - pos, &rel_off, &pair_idx))
             break;
-        count++;
-        size_t adv = (size_t)(m - p) + g_old_len;
-        p += adv;
-        rem -= adv;
+        match_count++;
+        final_len += rel_off + g_pairs[pair_idx].new_len;
+        pos += rel_off + g_pairs[pair_idx].old_len;
     }
+    final_len += in_len - pos;
 
-    if (count == 0) {
+    if (match_count == 0) {
         uint8_t *copy = (uint8_t *)malloc(in_len + 1);
         if (!copy)
             die("casper-relocate: out of memory");
@@ -198,33 +287,34 @@ static uint8_t *replace_all(const uint8_t *in, size_t in_len, size_t *out_len) {
         return copy;
     }
 
-    size_t final_len = in_len + count * g_new_len - count * g_old_len;
+    if (out_changed)
+        *out_changed = 1;
+
     uint8_t *out = (uint8_t *)malloc(final_len + 1);
     if (!out)
         die("casper-relocate: out of memory");
 
     uint8_t *dst = out;
-    p = in;
-    rem = in_len;
-    while (rem >= g_old_len) {
-        const uint8_t *m = (const uint8_t *)memmem(p, rem, g_old, g_old_len);
-        if (!m)
+    pos = 0;
+    while (in_len - pos >= g_min_old_len) {
+        size_t rel_off = 0;
+        size_t pair_idx = 0;
+        if (!find_earliest_match(in + pos, in_len - pos, in_len - pos, &rel_off, &pair_idx))
             break;
-        size_t prefix = (size_t)(m - p);
-        if (prefix > 0) {
-            memcpy(dst, p, prefix);
-            dst += prefix;
+        if (rel_off > 0) {
+            memcpy(dst, in + pos, rel_off);
+            dst += rel_off;
         }
-        if (g_new_len > 0) {
-            memcpy(dst, g_new, g_new_len);
-            dst += g_new_len;
+        size_t nlen = g_pairs[pair_idx].new_len;
+        if (nlen > 0) {
+            memcpy(dst, g_pairs[pair_idx].new_str, nlen);
+            dst += nlen;
         }
-        size_t adv = prefix + g_old_len;
-        p += adv;
-        rem -= adv;
+        pos += rel_off + g_pairs[pair_idx].old_len;
     }
-    if (rem > 0) {
-        memcpy(dst, p, rem);
+    if (pos < in_len) {
+        size_t rem = in_len - pos;
+        memcpy(dst, in + pos, rem);
         dst += rem;
     }
     *dst = '\0';
@@ -386,7 +476,21 @@ static void stream_regular_same_len(sink_t *out, uint64_t size) {
         return;
 
     const size_t chunk_cap = 65536;
-    size_t buf_cap = chunk_cap + g_old_len;
+    if (g_num_pairs == 0) {
+        uint8_t buf[65536];
+        uint64_t remaining = size;
+        while (remaining > 0) {
+            size_t to_read = remaining > sizeof(buf) ? sizeof(buf) : (size_t)remaining;
+            read_exact(buf, to_read);
+            sink_write(out, buf, to_read);
+            remaining -= to_read;
+        }
+        read_pad(size);
+        write_pad(out, size);
+        return;
+    }
+
+    size_t buf_cap = chunk_cap + g_max_old_len;
     uint8_t *buf = (uint8_t *)malloc(buf_cap);
     if (!buf)
         die("casper-relocate: out of memory");
@@ -401,16 +505,19 @@ static void stream_regular_same_len(sink_t *out, uint64_t size) {
         size_t total = carry + to_read;
 
         size_t pos = 0;
-        while (total - pos >= g_old_len) {
-            uint8_t *m = (uint8_t *)memmem(buf + pos, total - pos, g_old, g_old_len);
-            if (!m)
-                break;
-            memcpy(m, g_new, g_new_len);
-            pos = (size_t)(m - buf) + g_old_len;
-        }
-
         if (remaining > 0) {
-            size_t safe = total > (g_old_len - 1) ? total - (g_old_len - 1) : 0;
+            while (total - pos >= g_max_old_len) {
+                size_t rem_in_buf = total - pos;
+                size_t max_start_excl = rem_in_buf - g_max_old_len + 1;
+                size_t rel_off = 0;
+                size_t pair_idx = 0;
+                if (!find_earliest_match(buf + pos, rem_in_buf, max_start_excl, &rel_off, &pair_idx))
+                    break;
+                memcpy(buf + pos + rel_off, g_pairs[pair_idx].new_str, g_pairs[pair_idx].new_len);
+                pos += rel_off + g_pairs[pair_idx].old_len;
+            }
+
+            size_t safe = total > (g_max_old_len - 1) ? total - (g_max_old_len - 1) : 0;
             if (safe < pos)
                 safe = pos;
             if (safe > 0)
@@ -419,6 +526,15 @@ static void stream_regular_same_len(sink_t *out, uint64_t size) {
             if (carry > 0)
                 memmove(buf, buf + safe, carry);
         } else {
+            while (total - pos >= g_min_old_len) {
+                size_t rem_in_buf = total - pos;
+                size_t rel_off = 0;
+                size_t pair_idx = 0;
+                if (!find_earliest_match(buf + pos, rem_in_buf, rem_in_buf, &rel_off, &pair_idx))
+                    break;
+                memcpy(buf + pos + rel_off, g_pairs[pair_idx].new_str, g_pairs[pair_idx].new_len);
+                pos += rel_off + g_pairs[pair_idx].old_len;
+            }
             sink_write(out, buf, total);
             carry = 0;
         }
@@ -489,12 +605,20 @@ static void process_node(sink_t *out, const char *entry_name, int depth) {
             size_t final_gz_len = 0;
 
             if (gzip_decompress(compressed, (size_t)size, &decompressed, &decomp_len) == 0) {
-                if (decomp_len >= g_old_len && memmem(decompressed, decomp_len, g_old, g_old_len) != NULL) {
+                size_t first_off = 0;
+                size_t first_idx = 0;
+                if (find_earliest_match(decompressed, decomp_len, decomp_len, &first_off, &first_idx)) {
                     size_t rew_len = 0;
-                    uint8_t *rew = replace_all(decompressed, decomp_len, &rew_len);
+                    int changed = 0;
+                    uint8_t *rew = replace_all(decompressed, decomp_len, &rew_len, &changed);
+                    write_scan(rew, rew_len);
+                    write_scan((const uint8_t *)"\n", 1);
                     if (gzip_compress_deterministic(rew, rew_len, &final_gz, &final_gz_len) == 0)
                         rewritten_gz = 1;
                     free(rew);
+                } else {
+                    write_scan(decompressed, decomp_len);
+                    write_scan((const uint8_t *)"\n", 1);
                 }
                 free(decompressed);
             }
@@ -506,7 +630,7 @@ static void process_node(sink_t *out, const char *entry_name, int depth) {
                 write_bytes(out, compressed, (size_t)size);
             }
             free(compressed);
-        } else if (g_old_len == g_new_len) {
+        } else if (g_all_same_len) {
             stream_regular_same_len(out, size);
         } else {
             uint8_t *raw = (uint8_t *)malloc((size_t)size ? (size_t)size : 1);
@@ -516,7 +640,7 @@ static void process_node(sink_t *out, const char *entry_name, int depth) {
                 read_exact(raw, (size_t)size);
             read_pad(size);
             size_t rew_len = 0;
-            uint8_t *rew = replace_all(raw, (size_t)size, &rew_len);
+            uint8_t *rew = replace_all(raw, (size_t)size, &rew_len, NULL);
             free(raw);
             write_bytes(out, rew, rew_len);
             free(rew);
@@ -531,7 +655,7 @@ static void process_node(sink_t *out, const char *entry_name, int depth) {
         expect_tag(")");
 
         size_t new_target_len = 0;
-        uint8_t *new_target = replace_all((const uint8_t *)target, target_len, &new_target_len);
+        uint8_t *new_target = replace_all((const uint8_t *)target, target_len, &new_target_len, NULL);
         free(target);
 
         write_cstr(out, "(");
@@ -582,7 +706,7 @@ static void process_node(sink_t *out, const char *entry_name, int depth) {
             expect_tag("node");
 
             size_t new_name_len = 0;
-            char *new_name = (char *)replace_all((const uint8_t *)name, name_len, &new_name_len);
+            char *new_name = (char *)replace_all((const uint8_t *)name, name_len, &new_name_len, NULL);
 
             if (strcmp(new_name, name) != 0) {
                 sink_t mem_sink = {1, NULL, 0, 0};
@@ -640,8 +764,102 @@ static void process_node(sink_t *out, const char *entry_name, int depth) {
     free(type);
 }
 
+static void record_pair(const char *old_s, size_t old_len, const char *new_s, size_t new_len) {
+    for (size_t i = 0; i < g_num_pairs; i++) {
+        if (g_pairs[i].old_len == old_len && memcmp(g_pairs[i].old_str, old_s, old_len) == 0) {
+            g_pairs[i].new_str = new_s;
+            g_pairs[i].new_len = new_len;
+            return;
+        }
+    }
+    if (g_num_pairs == g_pairs_cap) {
+        g_pairs_cap = g_pairs_cap ? g_pairs_cap * 2 : 8;
+        g_pairs = (reloc_pair_t *)realloc(g_pairs, g_pairs_cap * sizeof(reloc_pair_t));
+        if (!g_pairs)
+            die("casper-relocate: out of memory");
+    }
+    char *old_copy = (char *)malloc(old_len + 1);
+    if (!old_copy)
+        die("casper-relocate: out of memory");
+    memcpy(old_copy, old_s, old_len);
+    old_copy[old_len] = '\0';
+    g_pairs[g_num_pairs].old_str = old_copy;
+    g_pairs[g_num_pairs].old_len = old_len;
+    g_pairs[g_num_pairs].new_str = new_s;
+    g_pairs[g_num_pairs].new_len = new_len;
+    g_num_pairs++;
+}
+
+static void finalize_pairs(void) {
+    size_t keep = 0;
+    for (size_t i = 0; i < g_num_pairs; i++) {
+        if (g_pairs[i].old_len == g_pairs[i].new_len
+            && memcmp(g_pairs[i].old_str, g_pairs[i].new_str, g_pairs[i].old_len) == 0) {
+            free(g_pairs[i].old_str);
+            continue;
+        }
+        g_pairs[keep++] = g_pairs[i];
+    }
+    g_num_pairs = keep;
+
+    g_all_same_len = 1;
+    if (g_num_pairs == 0) {
+        g_min_old_len = 0;
+        g_max_old_len = 0;
+        return;
+    }
+
+    g_min_old_len = g_pairs[0].old_len;
+    g_max_old_len = g_pairs[0].old_len;
+    for (size_t i = 0; i < g_num_pairs; i++) {
+        if (g_pairs[i].old_len < g_min_old_len)
+            g_min_old_len = g_pairs[i].old_len;
+        if (g_pairs[i].old_len > g_max_old_len)
+            g_max_old_len = g_pairs[i].old_len;
+        if (g_pairs[i].old_len != g_pairs[i].new_len)
+            g_all_same_len = 0;
+    }
+}
+
 int main(int argc, char **argv) {
-    if (argc < 3 || argv[1][0] == '\0' || argv[2][0] == '\0' || strcmp(argv[1], argv[2]) == 0) {
+    signal(SIGPIPE, SIG_IGN);
+    int fl = fcntl(CASPER_SCAN_FD, F_GETFL);
+    if (fl != -1) {
+        int acc = fl & O_ACCMODE;
+        if (acc == O_WRONLY || acc == O_RDWR)
+            g_scan_fd = CASPER_SCAN_FD;
+    }
+
+    if (argc >= 2 && strchr(argv[1], ':') != NULL) {
+        for (int i = 1; i < argc; i++) {
+            const char *colon = strchr(argv[i], ':');
+            if (!colon)
+                die("casper-relocate: expected <old>:<new> argument");
+            if (strchr(colon + 1, ':') != NULL)
+                die("casper-relocate: ambiguous ':' in <old>:<new> argument");
+            size_t old_len = (size_t)(colon - argv[i]);
+            const char *new_s = colon + 1;
+            size_t new_len = strlen(new_s);
+            if (old_len == 0 && new_len == 0)
+                continue;
+            if (old_len == 0)
+                die("casper-relocate: empty <old> in <old>:<new> argument");
+            record_pair(argv[i], old_len, new_s, new_len);
+        }
+    } else if (argc == 3) {
+        if (strchr(argv[2], ':') != NULL)
+            die("casper-relocate: unexpected ':' in legacy 2-argument mode");
+        if (argv[1][0] != '\0' && argv[2][0] != '\0')
+            record_pair(argv[1], strlen(argv[1]), argv[2], strlen(argv[2]));
+    } else if (argc == 1 || (argc == 2 && argv[1][0] == '\0')) {
+        /* Scan-only or raw passthrough */
+    } else {
+        die("usage: casper-relocate (<old> <new> | <old1>:<new1> [<old2>:<new2> ...])");
+    }
+
+    finalize_pairs();
+
+    if (g_num_pairs == 0 && g_scan_fd < 0) {
         uint8_t buf[65536];
         while (1) {
             ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
@@ -656,11 +874,6 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
-
-    g_old = argv[1];
-    g_old_len = strlen(g_old);
-    g_new = argv[2];
-    g_new_len = strlen(g_new);
 
     sink_t stdout_sink = {0, NULL, 0, 0};
     expect_tag(NAR_VERSION_MAGIC);

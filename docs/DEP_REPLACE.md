@@ -29,7 +29,7 @@ In CASPER, because every package with non-plaintext references already carries a
    - `relocate.sh` does not assume that the store path being rewritten is `$out` (`self`). It simply rewrites `<old-hash>-<name>` $\to$ `<new-hash>-<name>` across the NAR stream (including ELF `PT_INTERP`, `DT_RUNPATH`, wrapper scripts, symlinks, and compressed `.gz` files).
    - CASPER already uses this mechanism during **multi-output builds** in [`DerivationBuilderImpl::registerOutputs`](../nix/src/libstore/build/derivation-builder-impl.cc#L688-L716): when leaf output `$out` is relocated to `<new-out-hash>-<name>`, dependent outputs (`$man`, `$dev`) invoke their `relocate.sh` to rewrite `<old-out-hash>-<name>` $\to$ `<new-out-hash>-<name>` before computing their own content address.
 2. **Multi-Pair Streaming Relocation**:
-   - By accepting multiple rewrite pairs in a single invocation (e.g., `casper-relocate <old1>:<new1> <old2>:<new2> ...`), `casper-relocate` can rewrite both external dependencies (`<generic-glibc> -> <optimized-glibc>`) and `self` (`<old-self> -> <blind-self>`) in a **single streaming pass** over the NAR.
+   - `casper-relocate` (and `withCasper` custom relocators) natively accepts multiple colon-separated rewrite pairs in a single invocation (`casper-relocate <old1>:<new1> [<old2>:<new2> ...]`, alongside legacy 2-argument `casper-relocate <old> <new>`), rewriting external dependencies (`<generic-glibc>:<optimized-glibc>`) and `self` (`<old-self>:<blind-self>`) simultaneously in a **single streaming pass** over the NAR while streaming decoded `.gz` payloads to FD 3 for reference scanning.
 
 ---
 

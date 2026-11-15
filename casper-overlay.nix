@@ -89,9 +89,33 @@ let
             #!/bin/sh
             export LC_ALL=C
             set -e
-            old="$1"
-            new="$2"
-            if [ -z "$old" ] || [ -z "$new" ] || [ "$old" = "$new" ]; then
+            has_scan_fd=0
+            if { true >&3; } 2>/dev/null; then
+                has_scan_fd=1
+            fi
+            no_rewrite=1
+            case "''${1:-}" in
+                *:*)
+                    for _pair in "$@"; do
+                        _o="''${_pair%%:*}"
+                        _n="''${_pair#*:}"
+                        if [ -n "$_o" ] && [ "$_o" != "$_n" ]; then
+                            no_rewrite=0
+                            break
+                        fi
+                    done
+                    old="''${1%%:*}"
+                    new="''${1#*:}"
+                    ;;
+                *)
+                    old="''${1:-}"
+                    new="''${2:-}"
+                    if [ -n "$old" ] && [ -n "$new" ] && [ "$old" != "$new" ]; then
+                        no_rewrite=0
+                    fi
+                    ;;
+            esac
+            if [ "$no_rewrite" = 1 ] && [ "$has_scan_fd" = 0 ]; then
                 cat
                 exit 0
             fi
@@ -100,13 +124,44 @@ let
             chmod +x "$out/bin/casper-relocate"
           ''
           + prev.lib.optionalString (relocateStream == "" && relocateExtra != "") ''
+            mkdir -p "$out/libexec"
+            cp ${casper-relocate}/bin/casper-relocate "$out/libexec/casper-relocate"
+            chmod +x "$out/libexec/casper-relocate"
             cat << 'CASPER_RELOCATE_EOF' > "$out/bin/casper-relocate"
             #!/bin/sh
             export LC_ALL=C
             set -e
-            old="$1"
-            new="$2"
-            if [ -z "$old" ] || [ -z "$new" ] || [ "$old" = "$new" ]; then
+            self_exec="$0"
+            if [ -L "$self_exec" ]; then
+                self_exec=$(readlink "$self_exec")
+            fi
+            base_reloc="$(dirname "$self_exec")/../libexec/casper-relocate"
+
+            has_scan_fd=0
+            if { true >&3; } 2>/dev/null; then
+                has_scan_fd=1
+            fi
+
+            no_rewrite=1
+            case "''${1:-}" in
+                *:*)
+                    for _pair in "$@"; do
+                        _o="''${_pair%%:*}"
+                        _n="''${_pair#*:}"
+                        if [ -n "$_o" ] && [ "$_o" != "$_n" ]; then
+                            no_rewrite=0
+                            break
+                        fi
+                    done
+                    ;;
+                *)
+                    if [ -n "''${1:-}" ] && [ -n "''${2:-}" ] && [ "$1" != "$2" ]; then
+                        no_rewrite=0
+                    fi
+                    ;;
+            esac
+
+            if [ "$no_rewrite" = 1 ] && [ "$has_scan_fd" = 0 ]; then
                 cat
                 exit 0
             fi
@@ -114,43 +169,56 @@ let
             workdir=$(mktemp -d)
             trap 'chmod -R u+w "$workdir" 2>/dev/null || true; rm -rf "$workdir"' EXIT
             target="$workdir/root"
-            nix-store --restore "$target"
+
+            # 1. Stream through C casper-relocate (handles .gz + FD 3, regular files, symlinks, filenames)
+            "$base_reloc" "$@" > "$workdir/reloc.nar"
+            nix-store --restore "$target" < "$workdir/reloc.nar"
+            rm -f "$workdir/reloc.nar"
             chmod -R u+w "$target" 2>/dev/null || true
 
-            # 1. Decompress, rewrite, and deterministically recompress gzip files containing old hash
-            find "$target" -type f -name '*.gz' 2>/dev/null | while IFS= read -r f; do
-                if gzip -dc "$f" 2>/dev/null | grep -qF "$old" 2>/dev/null; then
-                    chmod u+w "$(dirname "$f")" "$f" 2>/dev/null || true
-                    if gzip -dc "$f" 2>/dev/null | sed "s|$old|$new|g" | gzip -n > "$f.tmp"; then
-                        cat "$f.tmp" > "$f"
-                    fi
-                    rm -f "$f.tmp"
-                fi
-            done
+            # 2. Package-specific CASPER relocation rules
+            run_extra() {
+                ${relocateExtra}
+            }
 
-            # 2. Rewrite regular files containing old hash in-place (preserving permissions)
-            find "$target" -type f ! -name '*.gz' -exec grep -lF "$old" {} + 2>/dev/null | while IFS= read -r f; do
-                chmod u+w "$(dirname "$f")" "$f" 2>/dev/null || true
-                if sed "s|$old|$new|g" "$f" > "$f.tmp" 2>/dev/null; then
-                    cat "$f.tmp" > "$f"
-                fi
-                rm -f "$f.tmp"
-            done
-
-            # 3. Rewrite symlinks whose target contains old hash
-            find "$target" -type l 2>/dev/null | while IFS= read -r l; do
-                lnk=$(readlink "$l" 2>/dev/null) || continue
-                case "$lnk" in
-                    *"$old"*)
-                        newlnk=$(printf '%s\n' "$lnk" | sed "s|$old|$new|g")
-                        chmod u+w "$(dirname "$l")" "$l" 2>/dev/null || true
-                        ln -snf "$newlnk" "$l" 2>/dev/null || true
+            if [ "$no_rewrite" = 1 ]; then
+                old=""
+                new=""
+                run_extra
+            else
+                case "''${1:-}" in
+                    *:*)
+                        _total=0
+                        for _pair in "$@"; do
+                            _o="''${_pair%%:*}"
+                            _n="''${_pair#*:}"
+                            if [ -n "$_o" ] && [ "$_o" != "$_n" ]; then
+                                _total=$((_total + 1))
+                            fi
+                        done
+                        _idx=0
+                        _orig_scan="$has_scan_fd"
+                        for _pair in "$@"; do
+                            old="''${_pair%%:*}"
+                            new="''${_pair#*:}"
+                            if [ -n "$old" ] && [ "$old" != "$new" ]; then
+                                _idx=$((_idx + 1))
+                                if [ "$_idx" -eq "$_total" ]; then
+                                    has_scan_fd="$_orig_scan"
+                                else
+                                    has_scan_fd=0
+                                fi
+                                run_extra
+                            fi
+                        done
+                        ;;
+                    *)
+                        old="$1"
+                        new="$2"
+                        run_extra
                         ;;
                 esac
-            done
-
-            # 4. Package-specific CASPER relocation rules
-            ${relocateExtra}
+            fi
 
             nix-store --dump "$target"
             CASPER_RELOCATE_EOF
@@ -226,24 +294,32 @@ let
   casperRelocateSnippets = {
     xz = ''
       find "$target" -type f -name '*.xz' 2>/dev/null | while IFS= read -r f; do
-          if xz -dc "$f" 2>/dev/null | grep -q "$old" 2>/dev/null; then
+          if [ "''${no_rewrite:-0}" = 0 ] && xz -dc "$f" 2>/dev/null | grep -qF "$old" 2>/dev/null; then
               chmod u+w "$(dirname "$f")" "$f" 2>/dev/null || true
               if xz -dc "$f" 2>/dev/null | sed "s|$old|$new|g" | xz -z > "$f.tmp"; then
                   cat "$f.tmp" > "$f"
               fi
               rm -f "$f.tmp"
           fi
+          if [ "''${has_scan_fd:-0}" = 1 ]; then
+              xz -dc "$f" >&3 2>/dev/null || true
+              printf '\n' >&3 2>/dev/null || true
+          fi
       done
     '';
 
     zst = ''
       find "$target" -type f -name '*.zst' 2>/dev/null | while IFS= read -r f; do
-          if zstd -dc "$f" 2>/dev/null | grep -q "$old" 2>/dev/null; then
+          if [ "''${no_rewrite:-0}" = 0 ] && zstd -dc "$f" 2>/dev/null | grep -qF "$old" 2>/dev/null; then
               chmod u+w "$(dirname "$f")" "$f" 2>/dev/null || true
               if zstd -dc "$f" 2>/dev/null | sed "s|$old|$new|g" | zstd -q > "$f.tmp"; then
                   cat "$f.tmp" > "$f"
               fi
               rm -f "$f.tmp"
+          fi
+          if [ "''${has_scan_fd:-0}" = 1 ]; then
+              zstd -dc "$f" >&3 2>/dev/null || true
+              printf '\n' >&3 2>/dev/null || true
           fi
       done
     '';

@@ -21,8 +21,8 @@ This document describes the detailed end-to-end operational pipeline, the `NAR` 
    - **Step 2a + 2b (In-Stream Blinding & Content Hashing—Zero Disk Writes)**:
      - The outer layer serializes `$out` into a NAR stream (`dumpPath($out)`), pipes it into `relocate.sh "<input-hash>-<name>" "<blind-hash>-<name>"`, and pipes `stdout` **directly into Nix's C++ SHA-256 `HashSink`** (deriving the 32-character Nix32 `casper:out` hash `<output-hash>`, e.g. `fahxx11...`).
      - Because self-references were blinded in the NAR stream first (even inside `.gz` entries), two builds with different input hashes that produce the same content yield the **exact same `<output-hash>`** without writing a blinded copy to disk.
-   - **Step 2c (In-Stream Relocation + Trusted Outer-Layer NAR Unpacking & Reference Scan)**:
-     - The outer layer pipes the NAR through `relocate.sh "<blind-hash>-<name>" "<output-hash>-<name>"` and feeds `stdout` directly into Nix's C++ `TeeSink(RestoreSink("/nix/store/<output-hash>-<name>"), HashAndRefScanSink)`—simultaneously unpacking the final output to `/nix/store/fahxx11...-foo-1.2.3`, computing its final `narHash`/`narSize`, and scanning the final uncompressed NAR stream for store references.
+   - **Step 2c (In-Stream Relocation + Trusted Outer-Layer NAR Unpacking & FD 3 Reference Scan)**:
+     - The outer layer pipes the NAR through `relocate.sh "<blind-hash>-<name>" "<output-hash>-<name>"` and feeds `stdout` directly into Nix's C++ `TeeSink(RestoreSink("/nix/store/<output-hash>-<name>"), HashAndRefScanSink)` while simultaneously draining file descriptor `3` (`CASPER_SCAN_FD = 3`, on which `relocate.sh` emits decoded/uncompressed payloads for `.gz`/`.xz`/`.zst` files) into a companion `PathRefScanSink`—unpacking the final output to `/nix/store/fahxx11...-foo-1.2.3`, computing its final `narHash`/`narSize`, and recording both plaintext and compressed runtime store references in a single pass.
    - **Step 2d / Pass 3 (Fixed-Point Verification)**:
      - Immediately after unpacking the relocated output, Nix re-blinds the unpacked output (`relocate.sh "<output-hash>-<name>" "<blind-hash>-<name>"`) into a SHA-256 `HashSink` and asserts that the re-blinded digest equals Step 2b's `normalizedNar.hash`—proving at build time that `<output-hash>` is a true fixed point and that Pass 2 was a lossless inverse of Pass 1.
 3. **Downstream Dependency Rewriting in Builder Args & Env**:
@@ -45,14 +45,17 @@ flowchart TD
 ## 2. `relocate.sh` as a `NAR` $\to$ `NAR` Stream Transformer (`stdin` $\to$ `stdout`)
 
 ### Core Contract
-Instead of mutating a directory tree in place on the host filesystem, `relocate` (`$out/nix-support/relocate.sh`) operates as a pure **`NAR` $\to$ `NAR` stream filter**:
+Instead of mutating a directory tree in place on the host filesystem, `relocate` (`$out/nix-support/relocate.sh`) operates as a pure **`NAR` $\to$ `NAR` stream filter** supporting both single-pair (`<old> <new>`) and multi-pair (`<old1>:<new1> [<old2>:<new2> ...]`) invocations, plus an optional hidden-reference scan sideband on file descriptor `3`:
 ```sh
 "$out/nix-support/relocate.sh" <old-self> <new-self> < input.nar > output.nar
+"$out/nix-support/relocate.sh" <old1>:<new1> [<old2>:<new2> ...] < input.nar > output.nar
 ```
 - `stdin`: A Nix Archive (NAR) byte stream representing the output (either a directory, regular file, or symlink).
-- `stdout`: The relocated Nix Archive (NAR) byte stream with `<old-self>` rewritten to `<new-self>`.
-- `$1` (`old-self`): `<old-hash>-<name>` (e.g. `abcdef...-foo-1.2.3` or `<blind-hash>-foo-1.2.3`).
-- `$2` (`new-self`): `<new-hash>-<name>` (e.g. `<blind-hash>-foo-1.2.3` or `fahxx11...-foo-1.2.3`).
+- `stdout`: The relocated Nix Archive (NAR) byte stream with all `(old, new)` pairs rewritten simultaneously in a single left-to-right pass.
+- `fd 3` (optional, when opened writable by the caller): Uncompressed/decoded payloads of opaque entries (such as `.gz`, `.xz`, or `.zst` files) so Nix's `PathRefScanSink` can discover runtime and sibling store references hidden inside compressed files.
+- Arguments:
+  - 2-argument form: `$1` (`<old-hash>-<name>`) and `$2` (`<new-hash>-<name>`), or `"" ""` for FD 3 scan-only mode.
+  - Multi-pair form: one or more `<old>:<new>` arguments (`:` is unambiguous because Nix store paths only allow `[0-9a-zA-Z+-._?=]`).
 - **Outer-Layer Unpacking**: The `relocate` process never writes to `/nix/store`. Whenever the outer layer (`nix-daemon`) wants to materialize the relocated output to disk (`/nix/store/<output-hash>-<name>`), **the outer layer unpacks the NAR from `stdout` itself** using its trusted C++ `RestoreSink` (`restorePath`).
 
 ### Why `NAR` $\to$ `NAR` Takes Precedence Over In-Place Directory Mutation
@@ -93,4 +96,4 @@ Because we do not keep symlinks at `/nix/store/<inputHash>-<name>`, downstream d
 3. **Multiple Outputs Within the Same Derivation (`out`, `lib`, `dev`, `doc`)**:
    - In `DerivationBuilderImpl::registerOutputs`, outputs of a multi-output derivation are topologically sorted (`sortedOutputNames | std::views::reverse`, leaves first).
    - When leaf output `lib` is relocated from `libInputHash` to `libOutHash`, `outputRewrites[libInputHash] = libOutHash` is recorded.
-   - Before hashing dependent output `out` or `dev`, `relocate.sh` is invoked for each `(oldHash, newHash)` in `outputRewrites` so cross-output references (`dev -> lib`, `out -> lib`) are updated to `libOutHash` before `out`/`dev` is hashed.
+   - Before hashing dependent output `out` or `dev`, `relocate.sh` is invoked once with all `(oldSib, newSib)` pairs (`<oldSib> <newSib>` when there is a single sibling rewrite, or `<oldSib1>:<newSib1> <oldSib2>:<newSib2> ...` when there are multiple sibling rewrites) so cross-output references (`dev -> lib`, `dev -> out`, `out -> lib`) are updated in a single pass before `out`/`dev` is hashed.
