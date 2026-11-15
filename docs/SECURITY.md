@@ -129,9 +129,10 @@ To enforce **Invariant 3** in practice without adding format-specific logic to N
 2. **Unsolvable Cryptographic Hash Loop for a Dishonest Relocator**:
    - Instead of blinding `<input-hash>-<out-name>` to a fixed constant (`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-<out-name>`), Nix extracts the 32-character Nix32 `<relocator-hash>` from the `relocate.sh` symlink target and sets:
      $$\texttt{blindSelf} = \langle\text{relocator-hash}\rangle\texttt{-}\langle\text{out-name}\rangle$$
-   - **Why the relocator cannot know `blindSelf`**:
+   - **Why the relocator cannot *statically* hardcode `blindSelf` (and why runtime self-discovery requires Section 6)**:
      - `<relocator-hash>` is derived from the cryptographic SHA-256 hash of the relocator derivation's own output (`makeContentAddressedOutputPath(narHash, relocatorName)`).
-     - For the relocator executable or script to hardcode `<relocator-hash>` inside its own code (for example, to detect `if ($2 == "<relocator-hash>-...")` and behave differently during Pass 1 blinding vs. Pass 2 relocation), the relocator would have to embed its own SHA-256 output hash inside itself before being hashed—an **unsolvable cryptographic preimage / fixed-point loop**.
+     - For the relocator executable or script to hardcode `<relocator-hash>` statically as a literal constant inside its own code (for example, `if ($2 == "8cgwszca...-...")`), the relocator would have to embed its own SHA-256 output hash inside itself before being hashed—an unsolvable cryptographic preimage / fixed-point loop.
+     - *Important caveat*: Although a relocator cannot hardcode `<relocator-hash>` statically, a dishonest relocator **can** discover `<relocator-hash>` dynamically at runtime (e.g., via `readlink("/proc/self/exe")`, `argv[0]`, the `nix-support/relocate.sh` symlink inside `stdin`'s NAR stream, or hashing its own mapped ELF pages). See **Section 6** below for how CASPER defeats runtime self-hash discovery and environment hijacking.
    - **Why `blindSelf` never collides with the `relocate.sh` symlink target**:
      - The `relocate.sh` symlink target is `/nix/store/<relocator-hash>-<relocator-name>/...`, whereas `blindSelf` is `<relocator-hash>-<out-name>`.
      - Nix enforces `!hasPrefix(<relocator-name>, <out-name>)` (and `casper-overlay.nix` prefixes relocator derivations with `casper-relocate-...`), so `<relocator-hash>-<out-name>` is never equal to or a prefix of `<relocator-hash>-<relocator-name>`, ensuring Pass 2 (`<relocator-hash>-<out-name>` $\to$ `<out-hash>-<out-name>`) never rewrites the `relocate.sh` symlink target itself.
@@ -146,3 +147,55 @@ To enforce **Invariant 3** in practice without adding format-specific logic to N
    - **Build-Time Pass 3 Fixed-Point Check & Offline Verification**:
      - During build, [`DerivationBuilderImpl::registerOutputs`](../nix/src/libstore/build/derivation-builder-impl.cc#L770-L796) immediately executes **Pass 3** on the unpacked output (`<out-hash>-<out-name>` $\to$ `blindSelf`) and asserts `pass3Nar.hash == normalizedNar.hash`, rejecting the build (`OutputRejected`) if Pass 2 was not a lossless inverse of Pass 1 or if the output hash is not a true fixed point.
      - Offline or after substitution from a binary cache, `nix hash casper` / `nix-hash --casper` repeats this exact Pass 3 check on `/nix/store/<out-hash>-<out-name>` directly.
+
+---
+
+## 6. Runtime Self-Hash Discovery, the Groupoid Isomorphism Theorem, and Enforced Countermeasures
+
+While Section 5 prevents a relocator from *statically* hardcoding `<relocator-hash>`, a malicious custom relocator $R_{\text{evil}}$ (`/nix/store/<H_evil_reloc>-evil-reloc/bin/...`) can always discover `<H_evil_reloc>` **at runtime**—via `readlink("/proc/self/exe")`, `argv[0]`, `/proc/self/maps`, the `nix-support/relocate.sh` symlink entry inside `stdin`'s NAR stream, or even by computing the CASPER hash of its own ELF image in memory.
+
+### 1. The Collision Attack & Why Black-Box Multi-Pass / Canary Checks Cannot Detect It
+
+Suppose an attacker wants a malicious derivation `evil.drv` (with output name `<name>`, matching a legitimate target package $G$ at `/nix/store/<H_good>-<name>`) to collide onto `<H_good>-<name>` while installing trojaned files $T_{\text{trojan}}(y)$ into the store:
+
+1. Let $N_{\text{good}}^{\text{blind}}$ be the exact blinded NAR byte stream of legitimate package $G$ (which is public and whose SHA-256 determines `<H_good>`).
+2. At runtime, $R_{\text{evil}}$ learns `<H_evil_reloc>`, computes $\texttt{blindSelf} = \langle H_{\text{evil\_reloc}}\rangle\texttt{-}\langle\text{name}\rangle$, and implements the piecewise deterministic function:
+   $$R_{\text{evil}}(T, a, b) = \begin{cases} N_{\text{good}}^{\text{blind}} & \text{if } b = \texttt{blindSelf} \\ T_{\text{trojan}}(b) & \text{if } b \neq \texttt{blindSelf} \end{cases}$$
+3. **Groupoid Isomorphism Theorem**: Define the state family $\{S_y\}$ by $S_{\texttt{blindSelf}} = N_{\text{good}}^{\text{blind}}$ and $S_y = T_{\text{trojan}}(y)$ for every $y \neq \texttt{blindSelf}$. On this family, $R_{\text{evil}}(S_a, a, b) = S_b$ for **all** $a, b$:
+   - **Pass 1** (`oldSelf` $\to$ `blindSelf`): $b = \texttt{blindSelf}$, so $R_{\text{evil}}$ emits $N_{\text{good}}^{\text{blind}}$, yielding $\text{outHash} = H_{\text{good}}$.
+   - **Pass 2** (`blindSelf` $\to$ `H_good-<name>`): $b \neq \texttt{blindSelf}$, so $R_{\text{evil}}$ materializes the trojaned tree $T_{\text{trojan}}(H_{\text{good}}\texttt{-}\langle\text{name}\rangle)$.
+   - **Pass 3 & `nix-hash --casper`** (`H_good-<name>` $\to$ `blindSelf`): $b = \texttt{blindSelf}$, so $R_{\text{evil}}$ again emits $N_{\text{good}}^{\text{blind}}$, passing fixed-point verification!
+   - **Random Canary Commutativity**: Even for a random canary $r \neq \texttt{blindSelf}$, $R_{\text{evil}}(R_{\text{evil}}(T_0, \text{oldSelf}, r), r, \text{newSelf}) = R_{\text{evil}}(T_{\text{trojan}}(r), r, \text{newSelf}) = T_{\text{trojan}}(\text{newSelf})$, so no black-box multi-pass or random-canary check can distinguish $R_{\text{evil}}$ from an honest groupoid action.
+
+Crucially, however, $R_{\text{evil}}$ can **only** emit $N_{\text{good}}^{\text{blind}}$ in Pass 1 by **stripping or forging its own `nix-support/relocate.sh -> /nix/store/<H_evil_reloc>-...` symlink** inside Pass 1's output NAR (replacing it with no `relocate.sh` if $G$ uses the built-in C++ relocator, or with `/nix/store/<H_good_reloc>-...` if $G$ uses an honest custom relocator).
+
+### 2. Protection 1: `nix-support/relocate.sh` Symlink Preservation Invariant
+
+Both [`DerivationBuilderImpl::registerOutputs`](../nix/src/libstore/build/derivation-builder-impl.cc) and [`verifyCasperPath`](../nix/src/nix/hash.cc) (`nix hash casper` / `nix-hash --casper`) enforce strict structural and NAR-level preservation of the relocator symlink:
+
+1. **Pre-Pass Structural Validation (`inspectOutputRelocator`)**:
+   - Inspects `nix-support` and `nix-support/relocate.sh` via `maybeLstat` (never `pathExists`, so dangling symlinks cannot silently bypass custom relocation).
+   - Rejects outputs where `nix-support` is a symlink through which `relocate.sh` is reachable (`'nix-support' must be a real directory`), where `relocate.sh` is not a symlink, where `linkTarget` is non-canonical (e.g. containing `/../` or redundant slashes that could cause `StoreDirConfig::toStorePath` and kernel path resolution to disagree), or where `relocatorStorePath` is not a declared valid input store path.
+2. **Streaming NAR AST Verification (`RelocatorLinkCheckSink`)**:
+   - After sibling relocation and **Pass 1 blinding** (and during `nix-hash --casper`), Nix parses the blinded NAR stream in $O(1)$ memory via `RelocatorLinkCheckSink` (a `NullFileSystemObjectSink` subclass with `skipContents = true`) and asserts that the root node is a directory, `nix-support` is a real directory, and `nix-support/relocate.sh` is a symlink with the **exact same `linkTarget`** (`/nix/store/<H_reloc>-...`).
+   - After **Pass 2 unpacking**, `verifyUnpackedRelocatorLink` asserts that the materialized store tree likewise retains the real directory `nix-support` and symlink `nix-support/relocate.sh -> linkTarget` (and Pass 3's SHA-256 equality with Pass 1's verified NAR guarantees the same for Pass 3).
+3. **Cryptographic Domain Separation with Zero Store Invalidation**:
+   - Because SHA-256 covers the entire canonical NAR stream, forcing Pass 1's blinded NAR to contain `nix-support/relocate.sh -> /nix/store/<H_reloc>-...` commits `<H_reloc>` directly inside the SHA-256 preimage of `<out-hash>`:
+     - No custom relocator ($H_{\text{evil\_reloc}}$) can collide with a standard package (which has no `nix-support/relocate.sh` in its blinded NAR) without finding a full SHA-256 collision ($2^{128}$ work) or 160-bit `casper:out` second preimage ($2^{160}$ work).
+     - No custom relocator ($H_{\text{evil\_reloc}}$) can collide with a package using a different honest relocator ($H_{\text{good\_reloc}} \neq H_{\text{evil\_reloc}}$).
+     - Every honest relocator (`casper-relocate`, `withCasper`) already preserves `nix-support/relocate.sh`, so **zero existing store paths are invalidated**.
+
+### 3. Protection 2: Closure-Bound Environment & Isolated Mount Namespace in `runRelocateScript`
+
+Protection 1 prevents a *dishonest* relocator derivation ($H_{\text{evil\_reloc}}$) from colliding with a package built using an *honest* relocator ($H_{\text{good\_reloc}}$). However, without environment isolation, a malicious derivation `evil.drv` could point `$out/nix-support/relocate.sh` to the **exact same honest relocator** $R_{\text{good}}$ (`/nix/store/<H_good_reloc>-...`, satisfying Protection 1!) and hijack $R_{\text{good}}$ externally if $R_{\text{good}}$ is a `withCasper` shell script or dynamic binary—via `drv.env` (`PATH=/build/evil-bin`, `LD_PRELOAD=/build/evil.so`, `BASH_ENV`, `XZ_OPT`), trojaned tools in `drv.inputPaths`, `drv.builder`, or files staged in `/build`, `/tmp`, or `/dev/shm`.
+
+To close this vector completely, [`ChrootLinuxDerivationBuilder::runRelocateScript`](../nix/src/libstore/linux/build/linux-derivation-builder.cc) and [`UnixDerivationBuilderImpl::runRelocateScript`](../nix/src/libstore/unix/build/unix-derivation-builder.cc) isolate relocator execution from all untrusted builder state:
+
+1. **Closure-Bound `/nix/store` Mount (`relocClosure` Only)**:
+   - `registerOutputs` computes `relocClosure` via `localStore.computeFSClosure(relocatorStorePath, relocClosure)`.
+   - On Linux, `ChrootLinuxDerivationBuilder::runRelocateScript` unconditionally unshares a private mount namespace (`CLONE_NEWNS` + `MS_PRIVATE | MS_REC`), mounts a fresh read-only `tmpfs` over `/nix/store`, and bind-mounts **only** `relocClosure` (plus system-level `defaultPathsInChroot`)—completely hiding `$out`, sibling scratch outputs, and all unrelated `drv.inputPaths` from the relocator.
+2. **Ephemeral `/tmp` & `/dev/shm` and Hidden `/build`**:
+   - Mounts fresh private `tmpfs` instances over `/tmp` and `/dev/shm`, and mounts an empty read-only `tmpfs` (`mode=0555,size=4k`) over `sandboxBuildDir` (`/build`), ensuring zero files staged during `buildPhase` survive into `runRelocateScript`.
+3. **Sanitized Closure-Only Environment & Direct Canonical Execution**:
+   - Never inherits `drv.env`, `drv.inputPaths`, or `drv.builder`. Instead, `envStrs` contains only sanitized defaults (`LC_ALL=C`, `HOME=/homeless-shelter`, `TMPDIR=/tmp`, and `PATH` constructed strictly from `relocClosure`), and `execve` invokes the canonical target path `/nix/store/<H_reloc>-...` directly.
+   - Correspondingly, [`withCasper`](../casper-overlay.nix) accepts `relocateInputs ? [ ]` and bakes `#!${prev.runtimeShell}`, `export PATH="..."`, and a standalone C NAR helper ([`casper-nar.c`](../casper-nar.c)) directly into `customRelocator` so custom relocator closures are completely self-contained.

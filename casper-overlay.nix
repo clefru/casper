@@ -68,15 +68,26 @@ let
   /* Low-level helper that attaches a symlink
      `$output/nix-support/relocate.sh -> ${relocatorDrv}/bin/casper-relocate`
      (always a symlink to a standalone derivation so its store-path hash serves
-     as the cryptographic blinding target) and updates `allowedReferences` / `allowedRequisites`. */
+     as the cryptographic blinding target, and executed by Nix inside an isolated
+     closure-bound environment) and updates `allowedReferences` / `allowedRequisites`. */
   withCasper =
     {
       relocateExtra ? "",
       relocateStream ? "",
+      relocateInputs ? [ ],
     }:
     pkg:
     let
       isDefaultSymlink = relocateStream == "" && relocateExtra == "";
+      relocBinPath = prev.lib.makeBinPath (
+        [
+          prev.coreutils
+          prev.findutils
+          prev.gnused
+          prev.gnugrep
+        ]
+        ++ relocateInputs
+      );
       customRelocator = prev.stdenv.mkDerivation {
         name = "casper-relocate-${pkg.pname or pkg.name or "custom"}";
         dontUnpack = true;
@@ -86,8 +97,9 @@ let
           ''
           + prev.lib.optionalString (relocateStream != "") ''
             cat << 'CASPER_RELOCATE_EOF' > "$out/bin/casper-relocate"
-            #!/bin/sh
+            #!${prev.runtimeShell}
             export LC_ALL=C
+            export PATH="${relocBinPath}"
             set -e
             has_scan_fd=0
             if { true >&3; } 2>/dev/null; then
@@ -127,15 +139,19 @@ let
             mkdir -p "$out/libexec"
             cp ${casper-relocate}/bin/casper-relocate "$out/libexec/casper-relocate"
             chmod +x "$out/libexec/casper-relocate"
+            "$CC" -O2 -Wall -Wextra -o "$out/libexec/casper-nar" ${./casper-nar.c}
             cat << 'CASPER_RELOCATE_EOF' > "$out/bin/casper-relocate"
-            #!/bin/sh
+            #!${prev.runtimeShell}
             export LC_ALL=C
+            export PATH="${relocBinPath}"
             set -e
             self_exec="$0"
             if [ -L "$self_exec" ]; then
                 self_exec=$(readlink "$self_exec")
             fi
-            base_reloc="$(dirname "$self_exec")/../libexec/casper-relocate"
+            base_dir="$(dirname "$self_exec")/../libexec"
+            base_reloc="$base_dir/casper-relocate"
+            nar_tool="$base_dir/casper-nar"
 
             has_scan_fd=0
             if { true >&3; } 2>/dev/null; then
@@ -172,7 +188,7 @@ let
 
             # 1. Stream through C casper-relocate (handles .gz + FD 3, regular files, symlinks, filenames)
             "$base_reloc" "$@" > "$workdir/reloc.nar"
-            nix-store --restore "$target" < "$workdir/reloc.nar"
+            "$nar_tool" --restore "$target" < "$workdir/reloc.nar"
             rm -f "$workdir/reloc.nar"
             chmod -R u+w "$target" 2>/dev/null || true
 
@@ -220,7 +236,7 @@ let
                 esac
             fi
 
-            nix-store --dump "$target"
+            "$nar_tool" --dump "$target"
             CASPER_RELOCATE_EOF
             chmod +x "$out/bin/casper-relocate"
           '';
