@@ -199,3 +199,60 @@ To close this vector completely, [`ChrootLinuxDerivationBuilder::runRelocateScri
 3. **Sanitized Closure-Only Environment & Direct Canonical Execution**:
    - Never inherits `drv.env`, `drv.inputPaths`, or `drv.builder`. Instead, `envStrs` contains only sanitized defaults (`LC_ALL=C`, `HOME=/homeless-shelter`, `TMPDIR=/tmp`, and `PATH` constructed strictly from `relocClosure`), and `execve` invokes the canonical target path `/nix/store/<H_reloc>-...` directly.
    - Correspondingly, [`withCasper`](../casper-overlay.nix) accepts `relocateInputs ? [ ]` and bakes `#!${prev.runtimeShell}`, `export PATH="..."`, and a standalone C NAR helper ([`casper-nar.c`](../casper-nar.c)) directly into `customRelocator` so custom relocator closures are completely self-contained.
+
+### 4. Output-Trampling Analysis & the Pass 1 $\to$ `TeeSink` $\to$ Pass 2 Dataflow Bottleneck
+
+Unlike normal software where untrusted build artifacts only pose a risk if *executed*, a content-addressed build system faces a **build-time squatting ("trampling") risk**: if an untrusted derivation `evil.drv` is built *before* a legitimate derivation `glibc.drv` and manages to register trojaned content at `/nix/store/<H_good>-glibc`, it squats on `glibc`'s content-addressed path (either poisoning consumers of `<H_good>` or causing `glibc.drv`'s subsequent build to fail with a `narHash` mismatch).
+
+Evaluating whether Linux sandbox or syscall holes could still allow output trampling splits cleanly into two cases:
+
+1. **Case A — `evil.drv` Supplies Its Own Dishonest Relocator $R_{\text{evil}}$ (`/nix/store/<H_evil_reloc>-...`)**:
+   - **Independent of the Linux sandbox**: Protection 1 runs in **trusted C++ inside `nix-daemon`** ([`RelocatorLinkCheckSink`](../nix/src/libstore/build/derivation-builder-impl.cc)) over the NAR pipe bytes *before* unpacking.
+   - Even if the OS sandbox were completely disabled and $R_{\text{evil}}$ invoked arbitrary syscalls, Pass 1's `blindedNar` is rejected unless it contains `nix-support/relocate.sh -> /nix/store/<H_evil_reloc>-...`. Because `<H_evil_reloc>` is committed inside `SHA256(blindedNar)`, `evil.drv` cannot land on `<H_good>` without finding a 160-bit SHA-256 second preimage.
+
+2. **Case B — `evil.drv` Points `nix-support/relocate.sh` to `glibc`'s *Honest* Relocator $R_{\text{good}}$ (`/nix/store/<H_good_reloc>-...`) and Exploits a Bug in $R_{\text{good}}$**:
+   - Here `<H_reloc>` matches `<H_good_reloc>`. Suppose $R_{\text{good}}$ is linked against a C library with a memory-corruption vulnerability (e.g., in `zlib` or `liblzma`), and `evil.drv` places a crafted `.gz`/`.xz` payload inside `$out` to hijack $R_{\text{good}}$ during Pass 1.
+   - **Why RCE in Pass 1 *Alone* Still Cannot Poison Pass 2 (The `TeeSink` Bottleneck)**:
+     In [`DerivationBuilderImpl::registerOutputs`](../nix/src/libstore/build/derivation-builder-impl.cc), **Pass 2 never reads `evil.drv`'s `$out`**—Pass 2's `stdin` is **`blindedNarSink.s`** (Pass 1's `stdout`, buffered in `nix-daemon` C++ RAM simultaneously with hashing):
+
+```mermaid
+flowchart LR
+    E["evil.drv $out (crafted .gz exploit)"] -->|"Pass 1 stdin"| P1["Process 1: R_good (hijacked in RAM)"]
+    P1 -->|"Pass 1 stdout"| T["C++ TeeSink (in nix-daemon RAM)"]
+    T --> H["SHA-256 HashSink -> must equal H_good"]
+    T --> B["blindedNarSink.s (forced to equal genuine glibc blinded NAR)"]
+    B -->|"Pass 2 stdin (no exploit bytes left)"| P2["Process 2: fresh R_good (argv: blindSelf -> H_good-glibc)"]
+    P2 -->|"Pass 2 stdout"| OUT["Unpacked /nix/store/H_good-glibc"]
+```
+
+   - Trace what happens to the attacker:
+     1. In **Pass 1**, Process 1 parses `evil.drv`'s crafted `.gz`, triggers the `zlib` overflow, and runs shellcode in Process 1's memory.
+     2. However, for `<out-hash>` to equal `<H_good>`, Process 1's `stdout` (`blindedNarSink.s`) **must hash to `<H_good>`**. By SHA-256 second-preimage resistance, Process 1 is **forced to emit legitimate `glibc`'s exact, clean, un-exploited blinded NAR**—it cannot leave its crafted `.gz` exploit payload inside `blindedNarSink.s` without changing `<out-hash>` to some unrelated `<H_other> != <H_good>`.
+     3. Process 1 exits and its corrupted RAM is destroyed. `nix-daemon` spawns a **fresh OS process (Process 2)** from unmodified $R_{\text{good}}$ on disk, passing `<blindSelf>` and `<H_good>-glibc` in `argv` and **`blindedNarSink.s`** on `stdin`.
+     4. Because Process 2's executable, `argv`, and `stdin` are **100% identical to legitimate `glibc`'s own Pass 2** (with zero exploit bytes remaining in `stdin` to re-trigger the `zlib` bug), honest $R_{\text{good}}$ deterministically unblinds genuine `glibc`—so all `evil.drv` accomplished was materializing an authentic, un-trojaned copy of `glibc`!
+   - **Why Cross-Pass Persistence Is the Only Remaining Bridge**:
+     For Process 2 to output a trojan when its `(executable, argv, stdin)` are identical to an honest `glibc` build, **mutable external state must survive into Process 2**—either from `buildPhase` (blocked by Protection 2) or planted by hijacked Process 1 across a kernel/IPC/mount sandbox hole (or full kernel container escape).
+
+---
+
+## 7. Design Space for Zero-Syscall & Provably Safe Relocator Substrates
+
+To eliminate **even the residual OS-sandbox / cross-pass persistence surface** in Section 6.4 (Case B) without privileging or enumerating specific compression algorithms (`gzip`, `xz`, `zstd`, ...) inside `nix-daemon`:
+
+| Substrate | TCB Size | Privileged Codecs Needed? | Guarantees & Limits |
+| :--- | :--- | :--- | :--- |
+| **1. Bidirectional Lens / Codec DSL** (*Boomerang / Nail-style*) | ~1k LoC (C/Rust) | **Yes** (`gzip`, `xz`, `zstd`, `CRC32`, `SHA-256` built into engine) | User never sees `<old>` or `<new>`; invertible by construction, zero compiler TCB, covers >99% of `nixpkgs`, but cannot express new compression schemes without extending the engine. |
+| **2. Safe Haskell (`-XSafe -fpackage-trust`) + `Free RelocF` / `forall h.`** | ~300k LoC (GHC) unless serialized to `reloc.plan` | **Yes** for bit-level compression (unless arbitrary `ByteString` code is allowed) | `SafeGate.hs` shim (`{-# LANGUAGE Safe #-}`) + pragma scrubbing (`Haskell2010` + `RankNTypes` only) + rank-2 `Sym h` enforces parametricity via free theorems on uncompressed structures; serializing `Free RelocF ()` to static bytecode removes GHC from the runtime TCB. |
+| **3. Dhall (`System Fω`) / Verified eBPF (`ubpf`)** | ~2–10k LoC | **Yes** (compression via host helpers) | Strong normalization (Dhall) or static loop/bounds verification (eBPF); sound parametricity in `System Fω` without GHC extension complexity. |
+| **4. Zero-Import Core WebAssembly (`no-WASI`)** | **~3–8k LoC** (`wasm3` / `wain` + `fuel`) | **No** (any C/Rust codec like `zlib`/`liblzma`/`zstd` compiles directly to `.wasm`) | **Eliminates OS sandbox reliance 100%**: zero syscalls, fresh linear memory instantiated per pass and discarded afterward. Even a `zlib` buffer overflow in Pass 1 stays trapped in Pass 1's linear buffer and vanishes before Pass 2 starts. |
+| **5. Proof-Carrying Codecs (`nanoda` Lean Kernel / CakeML)** | **~2.5k LoC** checker (+ verified CakeML/Wasm runner) | **No** (each codec library proves $\forall v,\; \text{decode}(\text{encode}(v)) = \text{Some}(v)$ once in `nixpkgs`) | Adds static universal lossless round-trip & termination proofs for honest codecs on top of zero-syscall isolation. (Executing raw proof-kernel reduction on 50 MB streams is too slow, so verified codecs target CakeML or zero-import Core Wasm.) |
+
+### Fundamental Theorem Limit: Why Protection 1 Remains Necessary Even Under Proof-Carrying Codecs
+
+Even in **Option 5** (where a package supplies `(decode, encode)` together with a machine-checked theorem $\forall v,\; \text{decode}(\text{encode}(v)) = \text{Some}(v)$), real bit-level compression (`xz`, `gzip`, `zstd`) **cannot** be typed polymorphically over an abstract `Hash : Type` because LZMA/Huffman/CRC64 *must* inspect the concrete `Word8` bits of embedded hashes.
+
+Once `encode : Bytes -> Bytes` inspects concrete bits, a maliciously constructed codec can **still satisfy $\forall v,\; \text{decode}(\text{encode}(v)) = \text{Some}(v)$** via a piecewise mathematical injection:
+$$\text{encode}_{\text{evil}}(v) = \begin{cases} \text{good\_bytes} & \text{if } v = v^* \\ \text{trojan\_elf\_embedding}(v) & \text{if } v \neq v^* \end{cases} \qquad \text{decode}_{\text{evil}}(b) = \begin{cases} \text{Some}(v^*) & \text{if } b = \text{good\_bytes} \\ \text{Some}(v) & \text{if } b = \text{trojan\_elf\_embedding}(v) \end{cases}$$
+Because the OS kernel (`execve`) and downstream tools consume the outer bytes $\text{encode}_{\text{evil}}(v)$ directly rather than calling $\text{decode}_{\text{evil}}$, no mathematical round-trip proof over concrete `Bytes -> Bytes` alone can rule out piecewise injections. Consequently:
+1. **Protection 1** (committing `<H_reloc>` inside `SHA256(blindedNar)` via `nix-support/relocate.sh`) is **always** the necessary cryptographic domain separator that prevents a malicious relocator from trampling another package's output path.
+2. **Zero-Import Core WebAssembly (Option 4)** (optionally paired with **Option 5** verified codecs) is the ideal generalized execution substrate: it privileges **zero** compression algorithms, runs near native speed in a ~4k-LoC interpreter, and reduces cross-pass persistence in Section 6.4 (Case B) to **zero** without trusting the Linux syscall/namespace sandbox.
